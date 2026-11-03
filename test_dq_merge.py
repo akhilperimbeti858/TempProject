@@ -3,7 +3,7 @@ from pyspark.sql import SparkSession, functions as F
 
 import dq_merge as dq
 
-ORR_SCHEMA = "a_id string, first_name string, last_name string, dob string, sex string, citizenship string"
+ORR_SCHEMA = "a_id string, first_name string, last_name string, dob string, sex string, country_of_birth string"
 ASY_SCHEMA = ORR_SCHEMA + ", middle_name string"
 
 ORR_ROWS = [

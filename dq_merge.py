@@ -5,7 +5,7 @@ HHS-ORR to affirmative asylum merge, with a data quality gate
 WHAT IT DOES
     Left-joins the HHS-ORR data to the affirmative asylum cases on a_id, flags whether each
     ORR record already has an asylum case, and checks that matched records really describe
-    the same person (name, DOB, sex, citizenship) before anything is written.
+    the same person (name, DOB, sex, country of birth) before anything is written.
 
 PIPELINE
     1. normalize()        Clean every comparison field into a helper column.
@@ -16,7 +16,7 @@ PIPELINE
     6. gate()             Reconcile counts and conflict rate. publish() refuses to write on failure.
 
 DQ_STATUS VALUES
-    VERIFIED            Name (fields or full name), DOB, sex and citizenship all agree.
+    VERIFIED            Name (fields or full name), DOB, sex and country of birth all agree.
     NEEDS_REVIEW        Minor differences only (typo, partial name, swapped fields).
     CONFLICT            Same a_id, but probably a different person.
     NO_MATCH            No affirmative asylum case has this a_id.
@@ -37,7 +37,7 @@ from pyspark.sql import DataFrame, Window, functions as F
 
 # Logical field -> physical column name. Edit if the schemas differ.
 ORR_COLS = {"key": "a_id", "first": "first_name", "last": "last_name",
-            "dob": "dob", "sex": "sex", "cit": "citizenship"}
+            "dob": "dob", "sex": "sex", "cob": "country_of_birth"}
 # Only the asylum table has a middle name. In the ORR data the middle name usually ends up
 # in the last-name column ("JAMES SMITH"), sometimes in the first-name column.
 ASY_COLS = {**ORR_COLS, "middle": "middle_name"}
@@ -53,14 +53,14 @@ DOB_FORMATS = ["yyyy-MM-dd", "M/d/yyyy", "yyyyMMdd", "yyyy-MM-dd HH:mm:ss"]
 MIN_DOB = "1900-01-01"
 NULL_TOKENS = ["", "NULL", "NONE", "N/A", "NA", "NAN", "?", "-"]
 SEX_MAP = {"M": "M", "MALE": "M", "F": "F", "FEMALE": "F", "X": "X", "U": "U", "UNKNOWN": "U"}
-CITIZENSHIP_MAP = {}               # e.g. {"GUAT": "GUATEMALA", "HOND": "HONDURAS"}
+COB_MAP = {}                       # e.g. {"GUAT": "GUATEMALA", "HOND": "HONDURAS"}
 PLACEHOLDER_NAMES = ["TEST", "UNKNOWN", "FNU", "LNU", "NFN", "NLN", "XXX", "DUMMY"]
 NO_MIDDLE_TOKENS = ["NMN", "NOMIDDLENAME"]
 ACCENTS, PLAIN = "ÁÀÂÄÃÅÉÈÊËÍÌÎÏÓÒÔÖÕÚÙÛÜÑÇÝ", "AAAAAAEEEEIIIIOOOOOUUUUNCY"
 
 # Matching. DOB and last name carry the most identity, so they weigh the most.
 NAME_FUZZY_MAX_DIST = 2            # Edit distance allowed for a typo (1 for names under 5 letters)
-WEIGHTS = {"first": 0.20, "last": 0.25, "dob": 0.30, "sex": 0.10, "cit": 0.15}
+WEIGHTS = {"first": 0.20, "last": 0.25, "dob": 0.30, "sex": 0.10, "cob": 0.15}
 CREDIT = {"EXACT": 1.0,
           "MIDDLE_IN_LAST": 1.0, "MIDDLE_INITIAL_IN_LAST": 1.0,
           "MIDDLE_IN_FIRST": 1.0, "MIDDLE_INITIAL_IN_FIRST": 1.0,
@@ -74,7 +74,7 @@ MAX_CONFLICT_RATE = 0.05       # Gate blocks the write above 5% conflicts...
 MIN_MATCHES_FOR_RATE = 20      # ...but only once there are enough matches for the rate to mean something
 
 STATUS = {"full": "dq_full_name_status", "first": "dq_first_name_status", "last": "dq_last_name_status",
-          "dob": "dq_dob_status", "sex": "dq_sex_status", "cit": "dq_citizenship_status"}
+          "dob": "dq_dob_status", "sex": "dq_sex_status", "cob": "dq_cob_status"}
 OTHER_KEYS_COL = "dq_possible_asylum_keys"
 
 
@@ -146,14 +146,14 @@ def normalize(df, cols, p):
     """
     dt = dict(df.dtypes)
     raw = lambda f: _col(cols[f])
-    cit = _clean(raw("cit"))
+    cob = _clean(raw("cob"))
     rules = {
         "key":      _key(raw("key"), dt[cols["key"]]),
         "first":    _compact(raw("first")),
         "last":     _compact(raw("last")),
         "dob":      _parse_dob(cols["dob"], dt[cols["dob"]]),
         "sex":      _lookup(_clean(raw("sex")), SEX_MAP),
-        "cit":      F.coalesce(_lookup(cit, CITIZENSHIP_MAP), cit),
+        "cob":      F.coalesce(_lookup(cob, COB_MAP), cob),
         "full_tok": _tokens(raw("first"), raw("last")),
     }
     # Three versions of the full name, because the ORR side may include, drop or abbreviate the middle
@@ -206,7 +206,7 @@ def table_checks(df, cols, p, table):
         ("IMPLAUSIBLE_DOB",           "MEDIUM",   c("dob") < F.lit(MIN_DOB).cast("date")),
         ("MISSING_SEX",               "LOW",      _clean(raw("sex")).isNull()),
         ("INVALID_SEX",               "MEDIUM",   _clean(raw("sex")).isNotNull() & c("sex").isNull()),
-        ("MISSING_CITIZENSHIP",       "LOW",      c("cit").isNull()),
+        ("MISSING_COB",               "LOW",      c("cob").isNull()),
         ("SAME_PERSON_MULTIPLE_KEYS", "HIGH",     F.col("_person_keys") > 1),
     ]
     fired = F.filter(F.array(*[F.when(cond, F.struct(F.lit(n).alias("check"), F.lit(s).alias("severity")))
@@ -294,13 +294,13 @@ def compare(j, matched):
     st = {f: F.when(swapped, "SWAPPED").otherwise(_cmp_name(o(f), a(f), variants.get(f, [])))
           for f in ("first", "last")}
     st.update(dob=_cmp_dob(o("dob"), a("dob")), sex=_cmp_exact(o("sex"), a("sex")),
-              cit=_cmp_exact(o("cit"), a("cit")),
+              cob=_cmp_exact(o("cob"), a("cob")),
               full=_cmp_full(o("full_tok"), a("full_tok"), a("nomid_tok"), a("init_tok")))
     j = j.withColumns({STATUS[f]: F.when(matched, e) for f, e in st.items()})
 
     s = {f: F.col(STATUS[f]) for f in st}
     credit = lambda x: _lookup(x, CREDIT).cast("double")
-    others = ["dob", "sex", "cit"]
+    others = ["dob", "sex", "cob"]
 
     # Name credit = the better of the first/last fields and the full name
     w_name = WEIGHTS["first"] + WEIGHTS["last"]
