@@ -70,6 +70,23 @@ NOTES_COL = "additional_notes"
 NOTE_DATE_REGEX = r"(\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2}|\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}|\b\d{8}\b)"
 NOTE_DATE_FORMATS = ["M/d/yyyy", "d/M/yyyy", "yyyy/M/d", "M/d/yy", "d/M/yy", "yyyyMMdd"]  # Both day orders
 NOTE_DOB_LABEL = r"(?i)\b(d\.?o\.?b|birth|born|fecha de nac\w*)\b"
+# Filler in the notes that is never a name ("as per nta:", "correct name", "child states"). Removed from the
+# note words before name matching so it cannot fuzzy-match a real name (CORRECT vs CORREA). Extend as needed.
+# Name particles (DE, LA, DEL) are listed too: they are dropped on both sides, so "DE LA CRUZ" matches on CRUZ.
+NOTE_STOPWORDS = [
+    # documents / sources
+    "NTA", "AS", "PER", "PERSON", "ACCORDING", "TO", "SPONSOR", "DOCS", "DOCUMENTS", "BIRTH", "CERTIFICATE",
+    "PASSPORT", "ORR", "UAC", "UC", "CBP", "ICE", "FILE", "RECORD", "RECORDS",
+    # corrections
+    "CORRECT", "CORRECTED", "CORRECTION", "ACTUAL", "UPDATED", "CHANGED", "WRONG", "INCORRECT", "SHOULD", "BE",
+    "IS", "WAS",
+    # field labels
+    "NAME", "NAMES", "FIRST", "LAST", "MIDDLE", "FULL", "AKA", "ALIAS", "KNOWN", "ALSO", "DOB", "DATE", "BORN",
+    "NACIMIENTO", "FECHA", "NOMBRE",
+    # narrative and particles
+    "CHILD", "MINOR", "STATES", "STATED", "SAYS", "REPORTS", "REPORTED", "THE", "AND", "OR", "OF", "IN", "ON",
+    "AT", "BY", "FOR", "WITH", "HIS", "HER", "THEIR", "DE", "LA", "DEL", "LOS", "LAS", "Y",
+]
 
 # Matching. DOB and last name carry the most identity, so they weigh the most.
 NAME_FUZZY_MAX_DIST = 2            # Edit distance allowed for a typo (1 for names under 5 letters)
@@ -167,11 +184,23 @@ def _note_dates(strings):
 
 def _words_in(words, note_tok):
     """True if every word in `words` appears in the note words, in any order.
-    Words of 6+ letters may differ by NAME_FUZZY_MAX_DIST, 4-5 letters by 1, shorter must be exact."""
+    Words of 6+ letters may differ by NAME_FUZZY_MAX_DIST, 4-5 letters by 1, shorter must be exact.
+    Stop words in the name (DE, LA) are skipped; at least one real name word must remain."""
     def close(w, t):
         dist = F.when(F.length(w) < 4, 0).when(F.length(w) < 6, 1).otherwise(NAME_FUZZY_MAX_DIST)
         return F.levenshtein(w, t) <= dist
+    words = F.array_except(words, _stop())
     return (F.size(words) > 0) & F.forall(words, lambda w: F.exists(note_tok, lambda t: close(w, t)))
+
+
+def _stop():
+    return F.array(*[F.lit(w) for w in NOTE_STOPWORDS])
+
+
+def _note_words(notes):
+    """Name-like words in a note: cleaned like names, with stop words and single letters removed."""
+    toks = F.filter(F.array_except(_tokens(notes), _stop()), lambda t: F.length(t) > 1)
+    return F.coalesce(toks, F.array().cast("array<string>"))
 
 
 def normalize(df, cols, p):
@@ -196,7 +225,7 @@ def normalize(df, cols, p):
     }
     if "notes" in cols:
         notes = raw("notes").cast("string")
-        rules["note_tok"] = F.coalesce(_tokens(notes), F.array().cast("array<string>"))
+        rules["note_tok"] = _note_words(notes)
         rules["note_dobs"] = _note_dates(F.regexp_extract_all(notes, F.lit(NOTE_DATE_REGEX), 1))
         # Dates right after a DOB label ("dob:", "born", "fecha de nacimiento"), for NOTES_DOB_DIFFERS
         labelled = F.regexp_extract(notes, NOTE_DOB_LABEL + r"[^0-9]{0,20}" + NOTE_DATE_REGEX, 2)

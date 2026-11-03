@@ -135,6 +135,12 @@ NOTES_ROWS = [
     ("700000005", "Jhon", "Pirez", "2013-06-06", "M", "Honduras", "aka Juan Carlos Pérez"),
     # NO_MATCH, ORR name + DOB from the notes matches a case under another a_id
     ("700000006", "Elena", "Vega", "2014-01-01", "F", "Guatemala", "DOB 2014-07-15 per sponsor docs"),
+    # Filler: CORRECT must not count as the asylum last name CORREA
+    ("700000007", "Ana", "Mendez", "2011-03-03", "F", "Honduras", "as per nta: correct dob 2011-01-02"),
+    # Filler around a real name still resolves it
+    ("700000008", "Jose", "Ramos", "2012-08-08", "M", "Honduras", "as per NTA: PEREZ, JUAN"),
+    # Name particles: asylum DE LA CRUZ matches on CRUZ
+    ("700000009", "Maria", "Santos", "2010-10-10", "F", "Mexico", "aka Maria de la Cruz"),
 ]
 NOTES_ASY_ROWS = [
     ("700000001", "Carlos", "Ruiz", "2011-01-02", "M", "Honduras", None),
@@ -143,6 +149,9 @@ NOTES_ASY_ROWS = [
     ("700000004", "Rosa", "Diaz", "2009-12-25", "F", "Mexico", None),
     ("800000005", "Juan Carlos", "Perez", "2013-06-06", "M", "Honduras", None),
     ("800000006", "Elena", "Vega", "2014-07-15", "F", "Guatemala", None),
+    ("700000007", "Ana", "Correa", "2011-01-02", "F", "Honduras", None),
+    ("700000008", "Juan", "Perez", "2012-08-08", "M", "Honduras", None),
+    ("700000009", "Maria", "De La Cruz", "2010-10-10", "F", "Mexico", None),
 ]
 
 
@@ -191,4 +200,14 @@ def test_rows_without_notes_unchanged(res, notes_res):
 
 def test_notes_dob_differs_check(notes_res):
     flagged = {r["a_id_raw"] for r in notes_res["issues"].where("check = 'NOTES_DOB_DIFFERS'").collect()}
-    assert flagged == {"700000001", "700000002", "700000006"}
+    assert flagged == {"700000001", "700000002", "700000006", "700000007"}
+
+
+def test_filler_words_do_not_match_names(notes_res):
+    m = by_key(notes_res)
+    r = m["700000007"]  # Only the DOB is backed by the note; the last name still conflicts
+    assert r[dq.NOTES_RESOLVED_COL] == ["dob"] and r["dq_status"] == "CONFLICT"
+    r = m["700000008"]
+    assert r[dq.NOTES_RESOLVED_COL] == ["first", "last"] and r["dq_status"] == "NEEDS_REVIEW"
+    r = m["700000009"]
+    assert r[dq.NOTES_RESOLVED_COL] == ["last"] and r["dq_status"] == "NEEDS_REVIEW"
