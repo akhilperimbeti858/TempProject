@@ -15,6 +15,13 @@ PIPELINE
     5. find_other_keys()  Find asylum cases with the same name + DOB under a different a_id.
     6. gate()             Reconcile counts and conflict rate. publish() refuses to write on failure.
 
+ADDITIONAL NOTES (optional ORR free-text column)
+    Used as evidence only, never to overwrite a value. If a field disagrees but the asylum value
+    appears in the notes (a date in any common format and either day order, or the name words in
+    any order), the field counts as NOTES_MATCH. The row can then reach NEEDS_REVIEW but never
+    VERIFIED, and dq_resolved_by_notes names the fields. Notes are also searched for names and
+    DOBs that match asylum cases under another a_id (dq_possible_key_source).
+
 DQ_STATUS VALUES
     VERIFIED            Name (fields or full name), DOB, sex and country of birth all agree.
     NEEDS_REVIEW        Minor differences only (typo, partial name, swapped fields).
@@ -58,6 +65,12 @@ PLACEHOLDER_NAMES = ["TEST", "UNKNOWN", "FNU", "LNU", "NFN", "NLN", "XXX", "DUMM
 NO_MIDDLE_TOKENS = ["NMN", "NOMIDDLENAME"]
 ACCENTS, PLAIN = "ÁÀÂÄÃÅÉÈÊËÍÌÎÏÓÒÔÖÕÚÙÛÜÑÇÝ", "AAAAAAEEEEIIIIOOOOOUUUUNCY"
 
+# Free-text notes (ORR only). Used as evidence, never to overwrite a value. Skipped if the column is absent.
+NOTES_COL = "additional_notes"
+NOTE_DATE_REGEX = r"(\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2}|\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}|\b\d{8}\b)"
+NOTE_DATE_FORMATS = ["M/d/yyyy", "d/M/yyyy", "yyyy/M/d", "M/d/yy", "d/M/yy", "yyyyMMdd"]  # Both day orders
+NOTE_DOB_LABEL = r"(?i)\b(d\.?o\.?b|birth|born|fecha de nac\w*)\b"
+
 # Matching. DOB and last name carry the most identity, so they weigh the most.
 NAME_FUZZY_MAX_DIST = 2            # Edit distance allowed for a typo (1 for names under 5 letters)
 WEIGHTS = {"first": 0.20, "last": 0.25, "dob": 0.30, "sex": 0.10, "cob": 0.15}
@@ -66,6 +79,7 @@ CREDIT = {"EXACT": 1.0,
           "MIDDLE_IN_FIRST": 1.0, "MIDDLE_INITIAL_IN_FIRST": 1.0,
           "MIDDLE_OMITTED": 1.0, "MIDDLE_INITIAL": 1.0,
           "REORDERED": 0.8, "SUBSET": 0.6, "PARTIAL": 0.6, "FUZZY": 0.6, "SWAPPED": 0.6,
+          "NOTES_MATCH": 0.9,  # The ORR field differs, but additional_notes contains the asylum value
           "DAY_MONTH_SWAP": 0.5, "OFF_BY_ONE_DAY": 0.5, "YEAR_DIFF": 0.25,
           "MISSING": 0.0, "MISMATCH": 0.0}
 EQUIVALENT = [s for s, c in CREDIT.items() if c == 1.0]  # Same value, different layout
@@ -76,6 +90,8 @@ MIN_MATCHES_FOR_RATE = 20      # ...but only once there are enough matches for t
 STATUS = {"full": "dq_full_name_status", "first": "dq_first_name_status", "last": "dq_last_name_status",
           "dob": "dq_dob_status", "sex": "dq_sex_status", "cob": "dq_cob_status"}
 OTHER_KEYS_COL = "dq_possible_asylum_keys"
+OTHER_KEYS_SOURCE_COL = "dq_possible_key_source"  # fields / notes_dob / notes_name
+NOTES_RESOLVED_COL = "dq_resolved_by_notes"
 
 
 # =============================================================================
@@ -138,6 +154,26 @@ def _parse_dob(name, dtype):
                         for fmt in DOB_FORMATS])
 
 
+def _note_dates(strings):
+    """Array of date-like strings -> array of plausible dates. Every format is tried, so an
+    ambiguous '01/02/2011' yields both Jan 2 and Feb 1."""
+    parsed = F.flatten(F.transform(strings, lambda s: F.array(*[
+        F.to_date(F.try_to_timestamp(F.regexp_replace(s, r"[.\-]", "/"), F.lit(fmt)))
+        for fmt in NOTE_DATE_FORMATS])))
+    plausible = F.filter(parsed, lambda d: d.isNotNull() & (d >= F.lit(MIN_DOB).cast("date"))
+                         & (d <= F.current_date()))
+    return F.coalesce(F.array_distinct(plausible), F.array().cast("array<date>"))
+
+
+def _words_in(words, note_tok):
+    """True if every word in `words` appears in the note words, in any order.
+    Words of 6+ letters may differ by NAME_FUZZY_MAX_DIST, 4-5 letters by 1, shorter must be exact."""
+    def close(w, t):
+        dist = F.when(F.length(w) < 4, 0).when(F.length(w) < 6, 1).otherwise(NAME_FUZZY_MAX_DIST)
+        return F.levenshtein(w, t) <= dist
+    return (F.size(words) > 0) & F.forall(words, lambda w: F.exists(note_tok, lambda t: close(w, t)))
+
+
 def normalize(df, cols, p):
     """Add a cleaned helper column per field (<p><field>) plus a deterministic row id.
 
@@ -155,7 +191,16 @@ def normalize(df, cols, p):
         "sex":      _lookup(_clean(raw("sex")), SEX_MAP),
         "cob":      F.coalesce(_lookup(cob, COB_MAP), cob),
         "full_tok": _tokens(raw("first"), raw("last")),
+        "first_tok": _tokens(raw("first")),
+        "last_tok": _tokens(raw("last")),
     }
+    if "notes" in cols:
+        notes = raw("notes").cast("string")
+        rules["note_tok"] = F.coalesce(_tokens(notes), F.array().cast("array<string>"))
+        rules["note_dobs"] = _note_dates(F.regexp_extract_all(notes, F.lit(NOTE_DATE_REGEX), 1))
+        # Dates right after a DOB label ("dob:", "born", "fecha de nacimiento"), for NOTES_DOB_DIFFERS
+        labelled = F.regexp_extract(notes, NOTE_DOB_LABEL + r"[^0-9]{0,20}" + NOTE_DATE_REGEX, 2)
+        rules["note_label_dobs"] = _note_dates(F.when(labelled != "", F.array(labelled)))
     # Three versions of the full name, because the ORR side may include, drop or abbreviate the middle
     rules["nomid_tok"] = rules["init_tok"] = rules["full_tok"]
     if "middle" in cols:
@@ -209,6 +254,10 @@ def table_checks(df, cols, p, table):
         ("MISSING_COB",               "LOW",      c("cob").isNull()),
         ("SAME_PERSON_MULTIPLE_KEYS", "HIGH",     F.col("_person_keys") > 1),
     ]
+    if "notes" in cols:  # A labelled DOB in the notes that the dob column does not agree with
+        label_dobs = c("note_label_dobs")
+        checks.append(("NOTES_DOB_DIFFERS", "MEDIUM", (F.size(label_dobs) > 0)
+                       & (c("dob").isNull() | ~F.array_contains(label_dobs, c("dob")))))
     fired = F.filter(F.array(*[F.when(cond, F.struct(F.lit(n).alias("check"), F.lit(s).alias("severity")))
                                for n, s, cond in checks]), lambda x: x.isNotNull())
     return (df.select(F.lit(table).alias("table"), F.col(p + "row_id").alias("row_id"),
@@ -301,21 +350,35 @@ def compare(j, matched):
     s = {f: F.col(STATUS[f]) for f in st}
     credit = lambda x: _lookup(x, CREDIT).cast("double")
     others = ["dob", "sex", "cob"]
+    names_ok = (s["first"].isin(EQUIVALENT) & s["last"].isin(EQUIVALENT)) | s["full"].isin(EQUIVALENT)
+
+    # Notes as evidence: a field that disagrees but whose asylum value appears in additional_notes
+    # counts as NOTES_MATCH for scoring and conflicts. The dq_*_status columns keep the ORR result,
+    # and VERIFIED still needs the ORR fields themselves to agree, so these rows end up NEEDS_REVIEW.
+    eff = dict(s)
+    if "o__note_tok" in j.columns:
+        hits = {"dob": F.exists(o("note_dobs"), lambda d: d == a("dob")),
+                "first": _words_in(a("first_tok"), o("note_tok")),
+                "last": _words_in(a("last_tok"), o("note_tok"))}
+        for f, hit in hits.items():
+            unresolved = ~s[f].isin(EQUIVALENT) & ~(names_ok if f in ("first", "last") else F.lit(False))
+            eff[f] = F.when(unresolved & F.coalesce(hit, F.lit(False)), "NOTES_MATCH").otherwise(s[f])
 
     # Name credit = the better of the first/last fields and the full name
     w_name = WEIGHTS["first"] + WEIGHTS["last"]
-    field_credit = (WEIGHTS["first"] * credit(s["first"]) + WEIGHTS["last"] * credit(s["last"])) / w_name
+    field_credit = (WEIGHTS["first"] * credit(eff["first"]) + WEIGHTS["last"] * credit(eff["last"])) / w_name
     score = (w_name * F.greatest(field_credit, credit(s["full"]))
-             + functools.reduce(add, [WEIGHTS[f] * credit(s[f]) for f in others]))
+             + functools.reduce(add, [WEIGHTS[f] * credit(eff[f]) for f in others]))
 
-    names_ok = (s["first"].isin(EQUIVALENT) & s["last"].isin(EQUIVALENT)) | s["full"].isin(EQUIVALENT)
     full_close = s["full"].isin(*EQUIVALENT, "REORDERED", "SUBSET", "FUZZY")
     all_ok = names_ok & functools.reduce(and_, [s[f].isin(EQUIVALENT) for f in others])
-    hard_conflict = ((s["dob"] == "MISMATCH")
-                     | (~full_close & (((s["first"] == "MISMATCH") & (s["last"] == "MISMATCH"))
-                                       | ((s["last"] == "MISMATCH") & (s["dob"] != "EXACT")))))
+    hard_conflict = ((eff["dob"] == "MISMATCH")
+                     | (~full_close & (((eff["first"] == "MISMATCH") & (eff["last"] == "MISMATCH"))
+                                       | ((eff["last"] == "MISMATCH") & (eff["dob"] != "EXACT")))))
     nonexact = ([F.when(~names_ok & ~s[f].isin(EQUIVALENT), F.lit(f)) for f in ("first", "last")]
                 + [F.when(~s[f].isin(EQUIVALENT), F.lit(f)) for f in others])
+    by_notes = [F.when(eff[f] == "NOTES_MATCH", F.lit(f)) for f in ("first", "last", "dob")]
+    present = lambda cols: F.filter(F.array(*cols), lambda x: x.isNotNull())
 
     return j.withColumns({
         "dq_match_score": F.when(matched, F.round(score, 3)),
@@ -323,30 +386,61 @@ def compare(j, matched):
                        .when(all_ok, "VERIFIED")
                        .when(hard_conflict | (score < REVIEW_THRESHOLD), "CONFLICT")
                        .otherwise("NEEDS_REVIEW")),
-        "dq_nonexact_fields": F.when(matched, F.filter(F.array(*nonexact), lambda x: x.isNotNull())),
+        "dq_nonexact_fields": F.when(matched, present(nonexact)),
+        NOTES_RESOLVED_COL: F.when(matched, present(by_notes)),
     })
 
 
 def find_other_keys(o, a):
-    """For each ORR row, the asylum a_ids (other than its own) whose name + DOB match it.
+    """For each ORR row, the asylum a_ids (other than its own) that look like the same person,
+    and which search found them:
 
-    On a NO_MATCH row this means a mistyped a_id (-> POSSIBLE_KEY_ERROR). On a CONFLICT row it
-    points to where the person really is. Names are compared as joined words, in entered and
+        fields      ORR name + ORR DOB
+        notes_dob   ORR name + a date found in additional_notes
+        notes_name  ORR DOB or a note date, and the asylum first AND last name words appear in the notes
+
+    On a NO_MATCH row a hit means a probable a_id error (-> POSSIBLE_KEY_ERROR). On a CONFLICT row it
+    points to where the person may really be. Names are compared as joined words, in entered and
     sorted order, and against the asylum name with the middle name kept, dropped or abbreviated.
     """
     keys = lambda tok: [F.array_join(tok, ""), F.array_join(F.array_sort(tok), "")]
-    a_keys = (a.where(F.col("a__key").isNotNull() & F.col("a__full_tok").isNotNull() & F.col("a__dob").isNotNull())
-               .select("a__key", "a__dob", F.explode(F.array_distinct(F.array(
-                   *[k for t in ("full_tok", "nomid_tok", "init_tok") for k in keys(F.col("a__" + t))])))
-                   .alias("a__name_key"))
-               .distinct())
-    o_keys = (o.where(F.col("o__full_tok").isNotNull() & F.col("o__dob").isNotNull())
-               .select("o__row_id", "o__key", "o__dob",
-                       F.explode(F.array_distinct(F.array(*keys(F.col("o__full_tok"))))).alias("o__name_key")))
-    return (o_keys.join(a_keys, (F.col("o__name_key") == F.col("a__name_key"))
-                                & (F.col("o__dob") == F.col("a__dob"))
-                                & ~F.col("a__key").eqNullSafe(F.col("o__key")))
-             .groupBy("o__row_id").agg(F.array_sort(F.collect_set("a__key")).alias(OTHER_KEYS_COL)))
+    other_key = ~F.col("a__key").eqNullSafe(F.col("o__key"))
+    a_ok = a.where(F.col("a__key").isNotNull() & F.col("a__full_tok").isNotNull() & F.col("a__dob").isNotNull())
+    a_keys = (a_ok.select("a__key", "a__dob", F.explode(F.array_distinct(F.array(
+                  *[k for t in ("full_tok", "nomid_tok", "init_tok") for k in keys(F.col("a__" + t))])))
+                  .alias("a__name_key"))
+                  .distinct())
+
+    # ORR name keys paired with the DOB to search on
+    with_name = o.where(F.col("o__full_tok").isNotNull())
+    name_keys = F.explode(F.array_distinct(F.array(*keys(F.col("o__full_tok"))))).alias("o__name_key")
+    searches = [with_name.where(F.col("o__dob").isNotNull())
+                         .select("o__row_id", "o__key", "o__full_tok", F.col("o__dob").alias("o__cand_dob"),
+                                 F.lit("fields").alias("source"))]
+    has_notes = "o__note_tok" in o.columns
+    if has_notes:
+        searches.append(with_name.select("o__row_id", "o__key", "o__full_tok",
+                                         F.explode("o__note_dobs").alias("o__cand_dob"),
+                                         F.lit("notes_dob").alias("source")))
+    by_name = functools.reduce(lambda x, y: x.unionByName(y), searches).select("*", name_keys)
+    hits = [by_name.join(a_keys, (F.col("o__name_key") == F.col("a__name_key"))
+                                 & (F.col("o__cand_dob") == F.col("a__dob")) & other_key)
+                   .select("o__row_id", "a__key", "source")]
+
+    if has_notes:  # Names written in the notes, checked against asylum cases with a candidate DOB
+        cand_dobs = F.array_distinct(F.filter(F.concat(F.array(F.col("o__dob")), F.col("o__note_dobs")),
+                                              lambda d: d.isNotNull()))
+        o_notes = (o.where(F.size("o__note_tok") > 0)
+                    .select("o__row_id", "o__key", "o__note_tok", F.explode(cand_dobs).alias("o__cand_dob")))
+        hits.append(o_notes.join(a_ok, (F.col("o__cand_dob") == F.col("a__dob")) & other_key)
+                           .where(_words_in(F.col("a__first_tok"), F.col("o__note_tok"))
+                                  & _words_in(F.col("a__last_tok"), F.col("o__note_tok")))
+                           .select("o__row_id", "a__key", F.lit("notes_name").alias("source")))
+
+    return (functools.reduce(lambda x, y: x.unionByName(y), hits)
+            .groupBy("o__row_id")
+            .agg(F.array_sort(F.collect_set("a__key")).alias(OTHER_KEYS_COL),
+                 F.array_sort(F.collect_set("source")).alias(OTHER_KEYS_SOURCE_COL)))
 
 
 def gate(orr_df, merged, issues):
@@ -402,13 +496,16 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
     if clash:
         raise ValueError(f"{ORR} columns collide with generated output columns: {clash}")
 
+    # additional_notes is optional: without it every notes step is skipped
+    orr_cols = {**ORR_COLS, "notes": NOTES_COL} if NOTES_COL in orr_df.columns else ORR_COLS
+
     # 1. Normalize (asylum columns are prefixed first so nothing collides)
     asy_prefixed = asylum_df.select([_col(c).alias(ASY_PREFIX + c) for c in asylum_df.columns])
-    o = _cache(normalize(orr_df, ORR_COLS, "o__"))
+    o = _cache(normalize(orr_df, orr_cols, "o__"))
     a = _cache(normalize(asy_prefixed, {f: ASY_PREFIX + c for f, c in ASY_COLS.items()}, "a__"))
 
     # 2. Single-table checks
-    issues = _cache(table_checks(o, ORR_COLS, "o__", ORR).unionByName(
+    issues = _cache(table_checks(o, orr_cols, "o__", ORR).unionByName(
         table_checks(a, {f: ASY_PREFIX + c for f, c in ASY_COLS.items()}, "a__", ASY)))
 
     # 3. LEFT join on the canonical a_id. Null keys never match.
@@ -429,7 +526,8 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
     merged = _cache(j.select(*[_col(c) for c in orr_df.columns],
                              *[_col(ASY_PREFIX + c) for c in asylum_df.columns],
                              _col(MATCH_FLAG_COL), "dq_status", "dq_match_score", "dq_nonexact_fields",
-                             *STATUS.values(), OTHER_KEYS_COL, "dq_row_issues"))
+                             NOTES_RESOLVED_COL, *STATUS.values(), OTHER_KEYS_COL, OTHER_KEYS_SOURCE_COL,
+                             "dq_row_issues"))
 
     # 5. Gate
     gate_df, passed = gate(orr_df, merged, issues)
@@ -438,7 +536,10 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
     field_summary = functools.reduce(lambda x, y: x.unionByName(y), [
         matched_rows.groupBy(F.lit(c.removeprefix("dq_").removesuffix("_status")).alias("field"),
                              F.col(c).alias("status")).count()
-        for c in STATUS.values()])
+        for c in STATUS.values()] + [
+        # How many matched rows the notes resolved, per field
+        matched_rows.select(F.lit("notes").alias("field"), F.explode(NOTES_RESOLVED_COL).alias("status"))
+                    .groupBy("field", "status").count()])
 
     return {"merged": merged, "issues": issues, "gate": gate_df, "passed": passed,
             "status_summary": merged.groupBy("dq_status").count(),

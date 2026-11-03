@@ -117,3 +117,78 @@ def test_column_clash_rejected(spark):
     orr = spark.createDataFrame(ORR_ROWS, ORR_SCHEMA).withColumn("dq_status", F.lit("x"))
     with pytest.raises(ValueError, match="collide"):
         dq.run_dq_merge(orr, spark.createDataFrame(ASY_ROWS, ASY_SCHEMA))
+
+
+# ---------------------------------------------------------------------------
+# additional_notes
+# ---------------------------------------------------------------------------
+NOTES_ROWS = [
+    # Wrong dob column, correct DOB labelled in the notes (M/D order)
+    ("700000001", "Carlos", "Ruiz", "2011-05-05", "M", "Honduras", "Correct dob: 01/02/2011"),
+    # Bare-ish date in a sentence, D/M order
+    ("700000002", "Luis", "Mora", "2010-09-09", "M", "Honduras", "child states born 13/04/2010"),
+    # Wrong name columns, right name in the notes as LAST, FIRST
+    ("700000003", "Pedro", "Lopez", "2012-03-03", "M", "Guatemala", "correct name PEREZ, JUAN"),
+    # Unrelated date in the notes: must stay CONFLICT
+    ("700000004", "Rosa", "Diaz", "2009-02-02", "F", "Mexico", "arrived 03/04/2022"),
+    # NO_MATCH, alias in the notes + ORR DOB matches a case under another a_id
+    ("700000005", "Jhon", "Pirez", "2013-06-06", "M", "Honduras", "aka Juan Carlos Pérez"),
+    # NO_MATCH, ORR name + DOB from the notes matches a case under another a_id
+    ("700000006", "Elena", "Vega", "2014-01-01", "F", "Guatemala", "DOB 2014-07-15 per sponsor docs"),
+]
+NOTES_ASY_ROWS = [
+    ("700000001", "Carlos", "Ruiz", "2011-01-02", "M", "Honduras", None),
+    ("700000002", "Luis", "Mora", "2010-04-13", "M", "Honduras", None),
+    ("700000003", "Juan", "Perez", "2012-03-03", "M", "Guatemala", None),
+    ("700000004", "Rosa", "Diaz", "2009-12-25", "F", "Mexico", None),
+    ("800000005", "Juan Carlos", "Perez", "2013-06-06", "M", "Honduras", None),
+    ("800000006", "Elena", "Vega", "2014-07-15", "F", "Guatemala", None),
+]
+
+
+@pytest.fixture(scope="session")
+def notes_res(spark):
+    orr = spark.createDataFrame([r + (None,) for r in ORR_ROWS] + NOTES_ROWS,
+                                ORR_SCHEMA + ", additional_notes string")
+    asy = spark.createDataFrame(ASY_ROWS + NOTES_ASY_ROWS, ASY_SCHEMA)
+    return dq.run_dq_merge(orr, asy)
+
+
+def test_notes_resolve_dob(notes_res):
+    m = by_key(notes_res)
+    for k in ("700000001", "700000002"):
+        assert m[k]["dq_status"] == "NEEDS_REVIEW", k
+        assert m[k][dq.NOTES_RESOLVED_COL] == ["dob"], k
+        assert m[k]["dq_dob_status"] == "MISMATCH", k  # The ORR column itself is still reported as wrong
+
+
+def test_notes_resolve_name(notes_res):
+    r = by_key(notes_res)["700000003"]
+    assert r["dq_status"] == "NEEDS_REVIEW"
+    assert r[dq.NOTES_RESOLVED_COL] == ["first", "last"]
+
+
+def test_unrelated_note_date_stays_conflict(notes_res):
+    r = by_key(notes_res)["700000004"]
+    assert r["dq_status"] == "CONFLICT" and r[dq.NOTES_RESOLVED_COL] == []
+
+
+def test_notes_find_other_keys(notes_res):
+    m = by_key(notes_res)
+    assert m["700000005"]["dq_status"] == "POSSIBLE_KEY_ERROR"
+    assert m["700000005"][dq.OTHER_KEYS_COL] == ["800000005"]
+    assert m["700000005"][dq.OTHER_KEYS_SOURCE_COL] == ["notes_name"]
+    assert m["700000006"]["dq_status"] == "POSSIBLE_KEY_ERROR"
+    assert m["700000006"][dq.OTHER_KEYS_SOURCE_COL] == ["notes_dob"]
+    assert m["444444444"][dq.OTHER_KEYS_SOURCE_COL] == ["fields"]
+
+
+def test_rows_without_notes_unchanged(res, notes_res):
+    before, after = by_key(res), by_key(notes_res)
+    for k in before:
+        assert after[k]["dq_status"] == before[k]["dq_status"], k
+
+
+def test_notes_dob_differs_check(notes_res):
+    flagged = {r["a_id_raw"] for r in notes_res["issues"].where("check = 'NOTES_DOB_DIFFERS'").collect()}
+    assert flagged == {"700000001", "700000002", "700000006"}
