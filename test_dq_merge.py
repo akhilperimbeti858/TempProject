@@ -1,3 +1,6 @@
+import os
+import sys
+
 import pytest
 from pyspark.sql import SparkSession, functions as F
 
@@ -32,6 +35,7 @@ ASY_ROWS = [
 
 @pytest.fixture(scope="session")
 def spark(tmp_path_factory):
+    os.environ.setdefault("PYSPARK_PYTHON", sys.executable)  # Python UDF workers need rapidfuzz/pandas too
     s = (SparkSession.builder.master("local[2]")
          .config("spark.sql.shuffle.partitions", "4")
          .config("spark.sql.warehouse.dir", str(tmp_path_factory.mktemp("wh")))
@@ -141,6 +145,10 @@ NOTES_ROWS = [
     ("700000008", "Jose", "Ramos", "2012-08-08", "M", "Honduras", "as per NTA: PEREZ, JUAN"),
     # Name particles: asylum DE LA CRUZ matches on CRUZ
     ("700000009", "Maria", "Santos", "2010-10-10", "F", "Mexico", "aka Maria de la Cruz"),
+    # Two name versions: words must not be mixed across them (JUAN from one, PEREZ from the other)
+    ("700000010", "Jose", "Ramos", "2012-09-09", "M", "Honduras", "aka Juan Lopez / also Pedro Perez"),
+    # Two versions of the same name: the LAST, FIRST one is the best match
+    ("700000011", "Jose", "Ramos", "2012-10-10", "M", "Honduras", "aka Jon Peres; correct name PEREZ, JUAN"),
 ]
 NOTES_ASY_ROWS = [
     ("700000001", "Carlos", "Ruiz", "2011-01-02", "M", "Honduras", None),
@@ -152,6 +160,8 @@ NOTES_ASY_ROWS = [
     ("700000007", "Ana", "Correa", "2011-01-02", "F", "Honduras", None),
     ("700000008", "Juan", "Perez", "2012-08-08", "M", "Honduras", None),
     ("700000009", "Maria", "De La Cruz", "2010-10-10", "F", "Mexico", None),
+    ("700000010", "Juan", "Perez", "2012-09-09", "M", "Honduras", None),
+    ("700000011", "Juan", "Perez", "2012-10-10", "M", "Honduras", None),
 ]
 
 
@@ -211,3 +221,37 @@ def test_filler_words_do_not_match_names(notes_res):
     assert r[dq.NOTES_RESOLVED_COL] == ["first", "last"] and r["dq_status"] == "NEEDS_REVIEW"
     r = m["700000009"]
     assert r[dq.NOTES_RESOLVED_COL] == ["last"] and r["dq_status"] == "NEEDS_REVIEW"
+
+
+def test_note_name_versions_are_not_mixed(notes_res):
+    r = by_key(notes_res)["700000010"]
+    assert r[dq.NOTES_RESOLVED_COL] == ["first"]          # JUAN LOPEZ is the best version; PEREZ is not borrowed
+    assert r[dq.NOTE_BEST_COL].startswith("JUAN LOPEZ")
+
+
+def test_best_of_several_note_versions(notes_res):
+    r = by_key(notes_res)["700000011"]
+    assert r[dq.NOTES_RESOLVED_COL] == ["first", "last"]
+    assert r[dq.NOTE_BEST_COL] == "PEREZ, JUAN -> first=JUAN last=PEREZ [LAST, FIRST] 100/100/100"
+
+
+def test_notes_extract_report(notes_res):
+    rep = {r["a_id"]: r for r in notes_res["notes_extract"].collect()}
+    assert "333333333" not in rep                           # Only rows with notes are reported
+    r = rep["700000003"]
+    cands = {(c["first"], c["last"], c["layout"]) for c in r["note_name_candidates"]}
+    assert ("JUAN", "PEREZ", "LAST, FIRST") in cands
+    assert r["best_note_name"]["layout"] == "LAST, FIRST"
+    assert r["best_note_name"]["first_score"] == 100.0
+    assert [str(d) for d in rep["700000001"]["note_dates"]] == ["2011-01-02", "2011-02-01"]  # Both day orders
+
+
+def test_similarity_columns(res):
+    m = by_key(res)
+    assert m["222222222"][dq.SIM_COLS["first"]] == pytest.approx(93.3, abs=0.1)   # JON vs JOHN
+    assert m["A012345678"][dq.SIM_COLS["full"]] == 100.0
+    assert m["333333333"][dq.SIM_COLS["first"]] is None                           # NO_MATCH
+
+
+def test_no_notes_column_has_no_report(res):
+    assert res["notes_extract"] is None

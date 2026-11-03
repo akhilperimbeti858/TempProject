@@ -16,11 +16,18 @@ PIPELINE
     6. gate()             Reconcile counts and conflict rate. publish() refuses to write on failure.
 
 ADDITIONAL NOTES (optional ORR free-text column)
-    Used as evidence only, never to overwrite a value. If a field disagrees but the asylum value
-    appears in the notes (a date in any common format and either day order, or the name words in
-    any order), the field counts as NOTES_MATCH. The row can then reach NEEDS_REVIEW but never
-    VERIFIED, and dq_resolved_by_notes names the fields. Notes are also searched for names and
-    DOBs that match asylum cases under another a_id (dq_possible_key_source).
+    Used as evidence only, never to overwrite a value. The note is cut into name candidates (at
+    punctuation, digits and filler words such as "as per nta"), and each candidate is split into
+    first/last every plausible way (LAST, FIRST / FIRST LAST / LAST FIRST). The candidate that best
+    matches the asylum name is scored with rapidfuzz; dates are read in any common format and both
+    day orders. A disagreeing field backed by the notes counts as NOTES_MATCH: the row can reach
+    NEEDS_REVIEW but never VERIFIED, and dq_resolved_by_notes names the fields. Notes are also
+    searched for asylum cases under another a_id (dq_possible_key_source). res["notes_extract"]
+    shows everything that was read from each note.
+
+FUZZY MATCHING
+    rapidfuzz (pip install rapidfuzz): Jaro-Winkler for single names, token_sort_ratio for full names.
+    The 0-100 scores are output as dq_*_name_similarity; thresholds are NAME_SIM_MIN / FULL_SIM_MIN.
 
 DQ_STATUS VALUES
     VERIFIED            Name (fields or full name), DOB, sex and country of birth all agree.
@@ -33,6 +40,8 @@ REQUIREMENTS
     Spark 3.5+ / Databricks Runtime 13.3+ (try_to_timestamp, withColumns).
 """
 import functools  # functools.reduce: a notebook "from pyspark.sql.functions import *" shadows bare reduce
+import re
+import unicodedata
 from operator import add, and_, or_
 
 from pyspark.sql import DataFrame, Window, functions as F
@@ -70,9 +79,8 @@ NOTES_COL = "additional_notes"
 NOTE_DATE_REGEX = r"(\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2}|\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}|\b\d{8}\b)"
 NOTE_DATE_FORMATS = ["M/d/yyyy", "d/M/yyyy", "yyyy/M/d", "M/d/yy", "d/M/yy", "yyyyMMdd"]  # Both day orders
 NOTE_DOB_LABEL = r"(?i)\b(d\.?o\.?b|birth|born|fecha de nac\w*)\b"
-# Filler in the notes that is never a name ("as per nta:", "correct name", "child states"). Removed from the
-# note words before name matching so it cannot fuzzy-match a real name (CORRECT vs CORREA). Extend as needed.
-# Name particles (DE, LA, DEL) are listed too: they are dropped on both sides, so "DE LA CRUZ" matches on CRUZ.
+# Filler in the notes that is never a name ("as per nta:", "correct name", "child states"). Stop words end a
+# name candidate, so they can never be read as a name (CORRECT vs CORREA). Extend as needed.
 NOTE_STOPWORDS = [
     # documents / sources
     "NTA", "AS", "PER", "PERSON", "ACCORDING", "TO", "SPONSOR", "DOCS", "DOCUMENTS", "BIRTH", "CERTIFICATE",
@@ -83,13 +91,18 @@ NOTE_STOPWORDS = [
     # field labels
     "NAME", "NAMES", "FIRST", "LAST", "MIDDLE", "FULL", "AKA", "ALIAS", "KNOWN", "ALSO", "DOB", "DATE", "BORN",
     "NACIMIENTO", "FECHA", "NOMBRE",
-    # narrative and particles
+    # narrative and relatives
     "CHILD", "MINOR", "STATES", "STATED", "SAYS", "REPORTS", "REPORTED", "THE", "AND", "OR", "OF", "IN", "ON",
-    "AT", "BY", "FOR", "WITH", "HIS", "HER", "THEIR", "DE", "LA", "DEL", "LOS", "LAS", "Y",
+    "AT", "BY", "FOR", "WITH", "HIS", "HER", "THEIR", "MOTHER", "FATHER", "SIBLING",
 ]
+# Name particles stay inside a name candidate and never start a last name ("Maria de la Cruz").
+NAME_PARTICLES = ["DE", "LA", "DEL", "LOS", "LAS", "Y", "DA", "DOS", "VAN"]
+NOTE_MAX_NAME_WORDS = 5            # Longer runs of words in a note are not treated as a name
 
 # Matching. DOB and last name carry the most identity, so they weigh the most.
-NAME_FUZZY_MAX_DIST = 2            # Edit distance allowed for a typo (1 for names under 5 letters)
+# rapidfuzz similarity, 0-100. Single names use Jaro-Winkler, full names use token_sort_ratio.
+NAME_SIM_MIN = 90                  # JON/JOHN = 93 (FUZZY), MARIA/MARIO = 92, ROBERT/RUPERT = 80, LEE/LIU = 56
+FULL_SIM_MIN = 88                  # "JON DOE" vs "JOHN DOE" = 93
 WEIGHTS = {"first": 0.20, "last": 0.25, "dob": 0.30, "sex": 0.10, "cob": 0.15}
 CREDIT = {"EXACT": 1.0,
           "MIDDLE_IN_LAST": 1.0, "MIDDLE_INITIAL_IN_LAST": 1.0,
@@ -109,6 +122,12 @@ STATUS = {"full": "dq_full_name_status", "first": "dq_first_name_status", "last"
 OTHER_KEYS_COL = "dq_possible_asylum_keys"
 OTHER_KEYS_SOURCE_COL = "dq_possible_key_source"  # fields / notes_dob / notes_name
 NOTES_RESOLVED_COL = "dq_resolved_by_notes"
+NOTE_BEST_COL = "dq_note_best_name"
+SIM_COLS = {"first": "dq_first_name_similarity", "last": "dq_last_name_similarity",
+            "full": "dq_full_name_similarity"}
+NOTE_CANDIDATE_SCHEMA = "array<struct<text:string,first:string,last:string,layout:string>>"
+NOTE_BEST_SCHEMA = ("struct<text:string,first:string,last:string,layout:string,"
+                    "first_score:double,last_score:double,full_score:double>")
 
 
 # =============================================================================
@@ -182,25 +201,118 @@ def _note_dates(strings):
     return F.coalesce(F.array_distinct(plausible), F.array().cast("array<date>"))
 
 
-def _words_in(words, note_tok):
-    """True if every word in `words` appears in the note words, in any order.
-    Words of 6+ letters may differ by NAME_FUZZY_MAX_DIST, 4-5 letters by 1, shorter must be exact.
-    Stop words in the name (DE, LA) are skipped; at least one real name word must remain."""
-    def close(w, t):
-        dist = F.when(F.length(w) < 4, 0).when(F.length(w) < 6, 1).otherwise(NAME_FUZZY_MAX_DIST)
-        return F.levenshtein(w, t) <= dist
-    words = F.array_except(words, _stop())
-    return (F.size(words) > 0) & F.forall(words, lambda w: F.exists(note_tok, lambda t: close(w, t)))
+# --- Notes: name candidates and rapidfuzz scoring (plain Python, run inside Spark UDFs) -------------
+
+def _py_words(text):
+    """Python twin of _tokens(): accents folded, uppercase, apostrophes and periods dropped, other
+    non-letters split, single letters dropped."""
+    s = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode().upper()
+    return [w for w in re.split(r"[^A-Z]+", re.sub(r"['.`]", "", s)) if len(w) > 1]
 
 
-def _stop():
-    return F.array(*[F.lit(w) for w in NOTE_STOPWORDS])
+def _splits(seg):
+    """One segment (words, with ',' markers) -> candidate (text, first, last, layout) tuples.
+    A comma means LAST, FIRST, and each comma part is also tried on its own. Without a comma every
+    split point is tried in both orders; a split never puts a particle (DE, LA) at the end of a part."""
+    words = [w for w in seg if w != ","]
+    if not words or len(words) > NOTE_MAX_NAME_WORDS or all(w in NAME_PARTICLES for w in words):
+        return []
+    if "," in seg:
+        i = seg.index(",")
+        last, first = [w for w in seg[:i] if w != ","], [w for w in seg[i + 1:] if w != ","]
+        out = []
+        if first and last:
+            out.append((" ".join(last) + ", " + " ".join(first), " ".join(first), " ".join(last), "LAST, FIRST"))
+        part = []
+        for w in seg + [","]:
+            if w == ",":
+                out += _splits(part)
+                part = []
+            else:
+                part.append(w)
+        return out
+    text = " ".join(words)
+    if len(words) == 1:
+        return [(text, None, None, "SINGLE")]
+    out = []
+    for k in range(1, len(words)):
+        if words[k - 1] in NAME_PARTICLES:
+            continue
+        a, b = " ".join(words[:k]), " ".join(words[k:])
+        out += [(text, a, b, "FIRST LAST"), (text, b, a, "LAST FIRST")]
+    return out
 
 
-def _note_words(notes):
-    """Name-like words in a note: cleaned like names, with stop words and single letters removed."""
-    toks = F.filter(F.array_except(_tokens(notes), _stop()), lambda t: F.length(t) > 1)
-    return F.coalesce(toks, F.array().cast("array<string>"))
+def _note_name_candidates(note):
+    """Every name candidate in a note, as (text, first, last, layout).
+
+    The note is cut into segments at punctuation ( ; / | ( ) : . ), digits and NOTE_STOPWORDS, so
+    'as per NTA: PEREZ, JUAN; aka Jon Peres' gives the segments 'PEREZ, JUAN' and 'JON PERES',
+    and each segment is split into first/last every plausible way (see _splits).
+    """
+    if note is None:
+        return []
+    stop, out, seen = set(NOTE_STOPWORDS), [], set()
+    for chunk in re.split(r"[;/|()\[\]{}\":.!?\n\r\t&+=]|\d+", str(note)):
+        seg = []
+        for piece in re.split(r"(,)", chunk):
+            words = [","] if piece == "," else _py_words(piece)
+            for w in words:
+                if w in stop:
+                    out += _splits(seg)
+                    seg = []
+                else:
+                    seg.append(w)
+        out += _splits(seg)
+    return [c for c in out if not (c in seen or seen.add(c))]
+
+
+def _jw(x, y):
+    from rapidfuzz.distance import JaroWinkler
+    if not x or not y:
+        return 0.0
+    return round(JaroWinkler.normalized_similarity(x.replace(" ", ""), y.replace(" ", "")) * 100, 1)
+
+
+def _token_sort(x, y):
+    from rapidfuzz import fuzz
+    return round(fuzz.token_sort_ratio(x, y), 1) if x and y else 0.0
+
+
+def _best_note_name(note, a_first, a_last, a_full, a_nomid):
+    """The note candidate that best matches the asylum name, with its scores (0-100).
+    All scores come from one candidate, so words are never mixed across name versions.
+    Rank = max((first + last) / 2, full); a single word counts half, so it never beats a full name."""
+    best, best_rank = None, (-1.0, -1.0)
+    for text, first, last, layout in _note_name_candidates(note):
+        if layout == "SINGLE":
+            f, l, full = _jw(text, a_first), _jw(text, a_last), 0.0
+            rank = (max(f, l) / 2, max(f, l) / 2)
+        else:
+            f, l = _jw(first, a_first), _jw(last, a_last)
+            words = f"{first} {last}"
+            full = max(_token_sort(words, a_full), _token_sort(words, a_nomid))
+            rank = (max((f + l) / 2, full), (f + l) / 2)  # Ties go to the better first/last split
+        if rank > best_rank:
+            best, best_rank = (text, first, last, layout, f, l, full), rank
+    return best
+
+
+def _note_udfs():
+    """(candidates, best) UDFs, built at call time so importing this module needs no Spark session."""
+    return (F.udf(_note_name_candidates, NOTE_CANDIDATE_SCHEMA), F.udf(_best_note_name, NOTE_BEST_SCHEMA))
+
+
+def _sim_udf(kind):
+    """Vectorized rapidfuzz similarity (0-100) between two string columns: 'jw' or 'token_sort'."""
+    import pandas as pd
+    fn = _jw if kind == "jw" else _token_sort
+
+    @F.pandas_udf("double")
+    def sim(x: pd.Series, y: pd.Series) -> pd.Series:
+        return pd.Series([fn(a, b) if isinstance(a, str) and isinstance(b, str) else None
+                          for a, b in zip(x, y)], dtype="float64")
+    return sim
 
 
 def normalize(df, cols, p):
@@ -225,7 +337,7 @@ def normalize(df, cols, p):
     }
     if "notes" in cols:
         notes = raw("notes").cast("string")
-        rules["note_tok"] = _note_words(notes)
+        rules["notes"] = notes
         rules["note_dobs"] = _note_dates(F.regexp_extract_all(notes, F.lit(NOTE_DATE_REGEX), 1))
         # Dates right after a DOB label ("dob:", "born", "fecha de nacimiento"), for NOTES_DOB_DIFFERS
         labelled = F.regexp_extract(notes, NOTE_DOB_LABEL + r"[^0-9]{0,20}" + NOTE_DATE_REGEX, 2)
@@ -298,20 +410,16 @@ def table_checks(df, cols, p, table):
 # 4. COMPARATORS (each returns a graded status string)
 # =============================================================================
 
-def _cmp_name(o, a, variants=()):
+def _cmp_name(o, a, sim, variants=()):
     """EXACT, then middle-name layouts, then PARTIAL (one name starts or ends with the other,
-    'GARCIA' vs 'GARCIALOPEZ'), then FUZZY (typo, or same soundex AND same first two letters)."""
-    lev = F.levenshtein(o, a)
-    max_dist = F.when(F.least(F.length(o), F.length(a)) < 5, 1).otherwise(NAME_FUZZY_MAX_DIST)
+    'GARCIA' vs 'GARCIALOPEZ'), then FUZZY (rapidfuzz Jaro-Winkler similarity >= NAME_SIM_MIN)."""
     affix = lambda x, y: x.startswith(y) | x.endswith(y)
     expr = F.when(o.isNull() | a.isNull(), "MISSING").when(o == a, "EXACT")
     for expected, status in variants:
         expr = expr.when(o == expected, status)
     return (expr
             .when((F.least(F.length(o), F.length(a)) >= 3) & (affix(o, a) | affix(a, o)), "PARTIAL")
-            .when((lev <= max_dist)
-                  | ((F.soundex(o) == F.soundex(a)) & (F.substring(o, 1, 2) == F.substring(a, 1, 2))
-                     & (lev <= NAME_FUZZY_MAX_DIST + 1)), "FUZZY")
+            .when(sim >= NAME_SIM_MIN, "FUZZY")
             .otherwise("MISMATCH"))
 
 
@@ -330,20 +438,20 @@ def _cmp_exact(o, a):
     return F.when(o.isNull() | a.isNull(), "MISSING").when(o == a, "EXACT").otherwise("MISMATCH")
 
 
-def _cmp_full(o, a_full, a_nomid, a_init):
+def _cmp_full(o, a_full, a_nomid, a_init, sim):
     """Full names (word arrays), regardless of the column split.
-    o = ORR first + last; a_full / a_nomid / a_init = asylum name with middle, without, with initial."""
+    o = ORR first + last; a_full / a_nomid / a_init = asylum name with middle, without, with initial.
+    sim = rapidfuzz token_sort_ratio (best of with / without middle), used for FUZZY."""
     joined = lambda x: F.array_join(x, "")
     same_words = lambda x, y: F.array_sort(x) == F.array_sort(y)
     subset = lambda x, y: F.size(F.array_except(x, y)) == 0
-    near = lambda x, y: F.levenshtein(joined(x), joined(y)) <= NAME_FUZZY_MAX_DIST
     return (F.when(o.isNull() | a_full.isNull(), "MISSING")
              .when(joined(o) == joined(a_full), "EXACT")
              .when(joined(o) == joined(a_nomid), "MIDDLE_OMITTED")
              .when(joined(o) == joined(a_init), "MIDDLE_INITIAL")
              .when(same_words(o, a_full) | same_words(o, a_nomid) | same_words(o, a_init), "REORDERED")
              .when((F.size(o) >= 2) & (subset(o, a_full) | subset(a_nomid, o)), "SUBSET")
-             .when(near(o, a_full) | near(o, a_nomid), "FUZZY")
+             .when(sim >= FULL_SIM_MIN, "FUZZY")
              .otherwise("MISMATCH"))
 
 
@@ -368,12 +476,23 @@ def compare(j, matched):
                     "last":  [(F.concat(mid, a("last")), "MIDDLE_IN_LAST"),
                               (F.concat(ini, a("last")), "MIDDLE_INITIAL_IN_LAST")]}
 
+    # rapidfuzz similarity (0-100) for every matched pair, kept in the output for inspection
+    jw, token_sort = _sim_udf("jw"), _sim_udf("token_sort")
+    words = lambda c: F.array_join(c, " ")
+    j = j.withColumns({
+        SIM_COLS["first"]: F.when(matched, jw(o("first"), a("first"))),
+        SIM_COLS["last"]: F.when(matched, jw(o("last"), a("last"))),
+        SIM_COLS["full"]: F.when(matched, F.greatest(token_sort(words(o("full_tok")), words(a("full_tok"))),
+                                                     token_sort(words(o("full_tok")), words(a("nomid_tok"))))),
+    })
+    sim = {f: F.col(c) for f, c in SIM_COLS.items()}
+
     swapped = (o("first") == a("last")) & (o("last") == a("first")) & (o("first") != o("last"))
-    st = {f: F.when(swapped, "SWAPPED").otherwise(_cmp_name(o(f), a(f), variants.get(f, [])))
+    st = {f: F.when(swapped, "SWAPPED").otherwise(_cmp_name(o(f), a(f), sim[f], variants.get(f, [])))
           for f in ("first", "last")}
     st.update(dob=_cmp_dob(o("dob"), a("dob")), sex=_cmp_exact(o("sex"), a("sex")),
               cob=_cmp_exact(o("cob"), a("cob")),
-              full=_cmp_full(o("full_tok"), a("full_tok"), a("nomid_tok"), a("init_tok")))
+              full=_cmp_full(o("full_tok"), a("full_tok"), a("nomid_tok"), a("init_tok"), sim["full"]))
     j = j.withColumns({STATUS[f]: F.when(matched, e) for f, e in st.items()})
 
     s = {f: F.col(STATUS[f]) for f in st}
@@ -385,10 +504,15 @@ def compare(j, matched):
     # counts as NOTES_MATCH for scoring and conflicts. The dq_*_status columns keep the ORR result,
     # and VERIFIED still needs the ORR fields themselves to agree, so these rows end up NEEDS_REVIEW.
     eff = dict(s)
-    if "o__note_tok" in j.columns:
+    if "o__notes" in j.columns:
+        best_udf = _note_udfs()[1]
+        j = j.withColumn("o__note_best", F.when(matched & o("notes").isNotNull(), best_udf(
+            o("notes"), words(a("first_tok")), words(a("last_tok")), words(a("full_tok")), words(a("nomid_tok")))))
+        b = F.col("o__note_best")
+        full_hit = b["full_score"] >= FULL_SIM_MIN
         hits = {"dob": F.exists(o("note_dobs"), lambda d: d == a("dob")),
-                "first": _words_in(a("first_tok"), o("note_tok")),
-                "last": _words_in(a("last_tok"), o("note_tok"))}
+                "first": (b["first_score"] >= NAME_SIM_MIN) | full_hit,
+                "last": (b["last_score"] >= NAME_SIM_MIN) | full_hit}
         for f, hit in hits.items():
             unresolved = ~s[f].isin(EQUIVALENT) & ~(names_ok if f in ("first", "last") else F.lit(False))
             eff[f] = F.when(unresolved & F.coalesce(hit, F.lit(False)), "NOTES_MATCH").otherwise(s[f])
@@ -417,6 +541,10 @@ def compare(j, matched):
                        .otherwise("NEEDS_REVIEW")),
         "dq_nonexact_fields": F.when(matched, present(nonexact)),
         NOTES_RESOLVED_COL: F.when(matched, present(by_notes)),
+        NOTE_BEST_COL: (F.format_string("%s -> first=%s last=%s [%s] %.0f/%.0f/%.0f", b["text"], b["first"],
+                                        b["last"], b["layout"], b["first_score"], b["last_score"],
+                                        b["full_score"]) if "o__notes" in j.columns
+                        else F.lit(None).cast("string")),
     })
 
 
@@ -426,7 +554,8 @@ def find_other_keys(o, a):
 
         fields      ORR name + ORR DOB
         notes_dob   ORR name + a date found in additional_notes
-        notes_name  ORR DOB or a note date, and the asylum first AND last name words appear in the notes
+        notes_name  ORR DOB or a note date, and one note name candidate matches the asylum first AND last
+                    name (rapidfuzz, see _best_note_name)
 
     On a NO_MATCH row a hit means a probable a_id error (-> POSSIBLE_KEY_ERROR). On a CONFLICT row it
     points to where the person may really be. Names are compared as joined words, in entered and
@@ -446,7 +575,7 @@ def find_other_keys(o, a):
     searches = [with_name.where(F.col("o__dob").isNotNull())
                          .select("o__row_id", "o__key", "o__full_tok", F.col("o__dob").alias("o__cand_dob"),
                                  F.lit("fields").alias("source"))]
-    has_notes = "o__note_tok" in o.columns
+    has_notes = "o__notes" in o.columns
     if has_notes:
         searches.append(with_name.select("o__row_id", "o__key", "o__full_tok",
                                          F.explode("o__note_dobs").alias("o__cand_dob"),
@@ -459,11 +588,16 @@ def find_other_keys(o, a):
     if has_notes:  # Names written in the notes, checked against asylum cases with a candidate DOB
         cand_dobs = F.array_distinct(F.filter(F.concat(F.array(F.col("o__dob")), F.col("o__note_dobs")),
                                               lambda d: d.isNotNull()))
-        o_notes = (o.where(F.size("o__note_tok") > 0)
-                    .select("o__row_id", "o__key", "o__note_tok", F.explode(cand_dobs).alias("o__cand_dob")))
+        words = lambda c: F.array_join(F.col(c), " ")
+        best = _note_udfs()[1](F.col("o__notes"), words("a__first_tok"), words("a__last_tok"),
+                               words("a__full_tok"), words("a__nomid_tok"))
+        o_notes = (o.where(F.col("o__notes").isNotNull())
+                    .select("o__row_id", "o__key", "o__notes", F.explode(cand_dobs).alias("o__cand_dob")))
+        full_hit = F.col("_b.full_score") >= FULL_SIM_MIN
         hits.append(o_notes.join(a_ok, (F.col("o__cand_dob") == F.col("a__dob")) & other_key)
-                           .where(_words_in(F.col("a__first_tok"), F.col("o__note_tok"))
-                                  & _words_in(F.col("a__last_tok"), F.col("o__note_tok")))
+                           .withColumn("_b", best)
+                           .where(((F.col("_b.first_score") >= NAME_SIM_MIN) | full_hit)
+                                  & ((F.col("_b.last_score") >= NAME_SIM_MIN) | full_hit))
                            .select("o__row_id", "a__key", F.lit("notes_name").alias("source")))
 
     return (functools.reduce(lambda x, y: x.unionByName(y), hits)
@@ -514,8 +648,13 @@ def _cache(df):
 def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
     """Run every step and return the merged result plus all reports. Writes nothing.
 
-    Returns: merged, issues, gate, passed, status_summary, field_summary (and _cached, for release()).
+    Returns: merged, issues, gate, passed, status_summary, field_summary, notes_extract
+    (None when there is no notes column), and _cached for release().
     """
+    try:
+        import rapidfuzz  # noqa: F401  (used inside the UDFs)
+    except ImportError as err:
+        raise ImportError("rapidfuzz is required: run %pip install rapidfuzz (or add it as a cluster library)") from err
     for name, df, cols in [(ORR, orr_df, ORR_COLS), (ASY, asylum_df, ASY_COLS)]:
         missing = [c for c in cols.values() if c not in df.columns]
         if missing:
@@ -555,8 +694,20 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
     merged = _cache(j.select(*[_col(c) for c in orr_df.columns],
                              *[_col(ASY_PREFIX + c) for c in asylum_df.columns],
                              _col(MATCH_FLAG_COL), "dq_status", "dq_match_score", "dq_nonexact_fields",
-                             NOTES_RESOLVED_COL, *STATUS.values(), OTHER_KEYS_COL, OTHER_KEYS_SOURCE_COL,
-                             "dq_row_issues"))
+                             NOTES_RESOLVED_COL, NOTE_BEST_COL, *STATUS.values(), *SIM_COLS.values(),
+                             OTHER_KEYS_COL, OTHER_KEYS_SOURCE_COL, "dq_row_issues"))
+
+    # What was read from additional_notes, one row per ORR record with notes, for checking by eye
+    notes_extract = None
+    if "o__notes" in j.columns:
+        candidates_udf = _note_udfs()[0]
+        notes_extract = (j.where(F.trim(F.col("o__notes")) != "")
+                          .select(_col(ORR_COLS["key"]), _col(NOTES_COL), _col(MATCH_FLAG_COL), "dq_status",
+                                  candidates_udf("o__notes").alias("note_name_candidates"),
+                                  F.col("o__note_dobs").alias("note_dates"),
+                                  F.col("o__note_label_dobs").alias("note_labelled_dobs"),
+                                  F.col("o__note_best").alias("best_note_name"),
+                                  NOTES_RESOLVED_COL, OTHER_KEYS_COL, OTHER_KEYS_SOURCE_COL))
 
     # 5. Gate
     gate_df, passed = gate(orr_df, merged, issues)
@@ -572,7 +723,8 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
 
     return {"merged": merged, "issues": issues, "gate": gate_df, "passed": passed,
             "status_summary": merged.groupBy("dq_status").count(),
-            "field_summary": field_summary, "_cached": [o, a, issues, merged]}
+            "field_summary": field_summary, "notes_extract": notes_extract,
+            "_cached": [o, a, issues, merged]}
 
 
 def release(results: dict):
@@ -608,6 +760,7 @@ def publish(results: dict, target_table: str, mode: str = "overwrite"):
 # display(res["field_summary"].orderBy("field", "status"))   # 3. Which fields disagree most?
 # display(res["issues"].groupBy("table", "severity", "check").count())
 # display(res["merged"].where("dq_status IN ('CONFLICT', 'POSSIBLE_KEY_ERROR', 'NEEDS_REVIEW')"))
+# display(res["notes_extract"])                          # Names / dates read from additional_notes
 #
 # publish(res, "catalog.schema.hhs_orr_asylum_merged")
 # release(res)

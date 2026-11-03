@@ -1,0 +1,4 @@
+pyspark>=3.5
+rapidfuzz>=3.0
+pandas
+pyarrow
