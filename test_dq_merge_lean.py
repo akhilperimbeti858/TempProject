@@ -2,7 +2,7 @@ import os
 import sys
 
 import pytest
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, functions as F
 
 import dq_merge as full
 import dq_merge_lean as lean
@@ -32,11 +32,18 @@ def spark():
             .config("spark.sql.shuffle.partitions", "4").getOrCreate())
 
 
+def asylum(spark, rows):
+    """Asylum fixture rows plus receipt_number / case_id derived from the a_id."""
+    return (spark.createDataFrame(rows, ASY_SCHEMA)
+            .withColumn("receipt_number", F.concat(F.lit("IOE"), "a_id"))
+            .withColumn("case_id", F.concat(F.lit("C"), "a_id")))
+
+
 @pytest.fixture(scope="session")
 def data(spark):
-    base = (spark.createDataFrame(ORR_ROWS, ORR_SCHEMA), spark.createDataFrame(ASY_ROWS, ASY_SCHEMA))
+    base = (spark.createDataFrame(ORR_ROWS, ORR_SCHEMA), asylum(spark, ASY_ROWS))
     notes = (spark.createDataFrame([r + (None,) for r in ORR_ROWS] + NOTES_ROWS + MULTI_ORR, NOTES_SCHEMA),
-             spark.createDataFrame(ASY_ROWS + NOTES_ASY_ROWS + MULTI_ASY, ASY_SCHEMA))
+             asylum(spark, ASY_ROWS + NOTES_ASY_ROWS + MULTI_ASY))
     return {"base": base, "notes": notes}
 
 
@@ -84,7 +91,7 @@ def test_multiple_possible_keys(lean_res):
 def test_passed(spark, lean_res):
     assert lean_res["base"]["passed"] is True
     assert lean_res["base"]["checks"]["detail"]["orr_rows"] == len(ORR_ROWS)
-    dup = spark.createDataFrame(ASY_ROWS + [("111111111", "X", "Y", "2001-01-01", "M", "Mexico", None)], ASY_SCHEMA)
+    dup = asylum(spark, ASY_ROWS + [("111111111", "X", "Y", "2001-01-01", "M", "Mexico", None)])
     res = lean.run_dq_merge(spark.createDataFrame(ORR_ROWS, ORR_SCHEMA), dup)
     assert res["passed"] is False and res["checks"]["ASYLUM_KEYS_UNIQUE"] is False
 
@@ -93,3 +100,27 @@ def test_row_issues(lean_res):
     m = by_key(lean_res["notes"]["merged"])
     assert "MEDIUM:NOTES_DOB_DIFFERS" in m["700000001"]["dq_row_issues"]
     assert m["A012345678"]["dq_row_issues"] is None
+
+
+def test_receipt_and_case_id(lean_res):
+    m = by_key(lean_res["notes"]["merged"])
+    r = m["444444444"]                                            # POSSIBLE_KEY_ERROR, one possible case
+    assert r["dq_possible_receipt_numbers"] == ["IOE555555555"] and r["dq_possible_case_ids"] == ["C555555555"]
+    assert (r["matched_receipt_number"], r["matched_case_id"]) == ("IOE555555555", "C555555555")
+    r = m["900000001"]                                            # Two possible cases: arrays line up by position
+    assert r["dq_possible_asylum_keys"] == ["900000002", "900000003"]
+    assert r["dq_possible_receipt_numbers"] == ["IOE900000002", "IOE900000003"]
+    assert r["dq_possible_case_ids"] == ["C900000002", "C900000003"]
+    assert (r["matched_receipt_number"], r["matched_case_id"]) == ("IOE900000002", "C900000002")
+    r = m["900000010"]                                            # Chosen by source, not lowest a_id
+    assert (r["matched_a_number"], r["matched_case_id"]) == ("900000020", "C900000020")
+    r = m["A012345678"]                                           # Matched: its own case
+    assert r["matched_receipt_number"] == r["asy_receipt_number"] == "IOE12345678"
+    r = m["333333333"]                                            # NO_MATCH
+    assert r["matched_receipt_number"] is None and r["matched_case_id"] is None
+
+
+def test_missing_receipt_column(spark, data):
+    orr, asy = data["base"]
+    with pytest.raises(ValueError, match="receipt_number"):
+        lean.run_dq_merge(orr, asy.drop("receipt_number"))

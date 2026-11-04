@@ -29,6 +29,8 @@ MATCHED_A_NUMBER (the join key for the full left join)
     POSSIBLE_KEY_ERROR  The other asylum case's a_id, as the asylum table stores it. If several were
                         found: the strongest source (fields > notes_dob > notes_name), then the lowest
                         a_id. All of them stay in dq_possible_asylum_keys; dq_multiple_possible_keys flags it.
+                        dq_possible_receipt_numbers / dq_possible_case_ids line up with the keys (same position
+                        = same case), and matched_receipt_number / matched_case_id belong to the chosen case.
     Matched rows        Their own asylum case's a_id, as the asylum table stores it.
     NO_MATCH            The ORR a_id.
 
@@ -49,7 +51,9 @@ from pyspark.sql import DataFrame, functions as F
 
 ORR_COLS = {"key": "a_id", "first": "first_name", "last": "last_name",
             "dob": "dob", "sex": "sex", "cob": "country_of_birth"}
-ASY_COLS = {**ORR_COLS, "middle": "middle_name"}   # Only the asylum table has a middle name
+# Only the asylum table has a middle name. receipt / case_id are not compared, only returned with
+# possible matches (dq_possible_receipt_numbers, matched_case_id, ...).
+ASY_COLS = {**ORR_COLS, "middle": "middle_name", "receipt": "receipt_number", "case_id": "case_id"}
 NOTES_COL = "additional_notes"                     # Optional ORR free-text column
 ASY_PREFIX = "asy_"                                # Prefix for asylum columns in the output
 MATCH_FLAG_COL = "asylum_case_exists"
@@ -481,7 +485,7 @@ def _score_matches(j, matched, pair_scores, has_notes):
 # 5. THE SAME PERSON UNDER ANOTHER a_id
 # =============================================================================
 
-def _other_keys(o, a, asy_key_raw, candidates, split_scores, has_notes):
+def _other_keys(o, a, carry, candidates, split_scores, has_notes):
     """Asylum cases (other than the row's own a_id) that look like the same person, from three searches:
 
         fields      ORR name + ORR DOB (exact, in Spark)
@@ -490,13 +494,15 @@ def _other_keys(o, a, asy_key_raw, candidates, split_scores, has_notes):
                     Pairs are blocked first on DOB + soundex of the last name, so Python only scores
                     plausible pairs. A typo in the first sound of the last name is not found here.
 
-    Returns one row per ORR row id: all raw asylum a_ids, the sources, the best a_id
-    (strongest source, then lowest a_id) and whether there was more than one.
+    `carry` = the asylum columns returned with each hit: [a_id, receipt_number, case_id], as stored.
+    Returns one row per ORR row id: the possible cases (three aligned arrays), the sources, the best
+    case (strongest source, then lowest a_id) and whether there was more than one.
     """
+    asy_key_raw, asy_receipt, asy_case = carry
     keys = lambda tok: [F.array_join(tok, ""), F.array_join(F.array_sort(tok), "")]
     other_key = ~F.col("a__key").eqNullSafe(F.col("o__key"))
     a_ok = a.where(F.col("a__key").isNotNull() & F.col("a__full_tok").isNotNull() & F.col("a__dob").isNotNull())
-    a_keys = (a_ok.select("a__key", "a__dob", asy_key_raw, F.explode(F.array_distinct(F.array(
+    a_keys = (a_ok.select("a__key", "a__dob", *carry, F.explode(F.array_distinct(F.array(
                   *[k for t in ("full_tok", "nomid_tok", "init_tok") for k in keys(F.col("a__" + t))])))
                   .alias("a__name_key")).distinct())
 
@@ -511,7 +517,7 @@ def _other_keys(o, a, asy_key_raw, candidates, split_scores, has_notes):
                .select("*", F.explode(F.array_distinct(F.array(*keys(F.col("o__full_tok"))))).alias("o__name_key")))
     hits = [by_name.join(a_keys, (F.col("o__name_key") == F.col("a__name_key"))
                                  & (F.col("cand_dob") == F.col("a__dob")) & other_key)
-                   .select("o__row_id", "a__key", asy_key_raw, "source")]
+                   .select("o__row_id", "a__key", *carry, "source")]
 
     if has_notes:
         cand_dobs = F.array_distinct(F.filter(F.concat(F.array(F.col("o__dob")), F.col("o__note_dobs")),
@@ -531,15 +537,21 @@ def _other_keys(o, a, asy_key_raw, candidates, split_scores, has_notes):
                                                          words("a__last_tok"), words("a__full_tok"),
                                                          words("a__nomid_tok")))
                          .where(((sc["first"] >= NAME_SIM_MIN) | full_hit) & ((sc["last"] >= NAME_SIM_MIN) | full_hit))
-                         .select("o__row_id", "a__key", asy_key_raw, F.lit("notes_name").alias("source")))
+                         .select("o__row_id", "a__key", *carry, F.lit("notes_name").alias("source")))
 
     rank = _lookup(F.col("source"), {k: str(v) for k, v in SOURCE_RANK.items()}).cast("int")
+    case = lambda: [F.col(asy_key_raw).cast("string").alias("a_id"), F.col(asy_receipt).cast("string").alias("receipt"),
+                    F.col(asy_case).cast("string").alias("case_id")]
+    # One struct per possible case, sorted by a_id; a case found by several searches appears once
+    cases = F.array_sort(F.collect_set(F.struct(*case())))
+    field = lambda name: F.transform(cases, lambda c: c[name])
     return (functools.reduce(lambda x, y: x.unionByName(y), hits)
             .groupBy("o__row_id")
-            .agg(F.array_sort(F.collect_set(F.col(asy_key_raw).cast("string"))).alias("dq_possible_asylum_keys"),
+            .agg(field("a_id").alias("dq_possible_asylum_keys"),
+                 field("receipt").alias("dq_possible_receipt_numbers"),
+                 field("case_id").alias("dq_possible_case_ids"),
                  F.array_sort(F.collect_set("source")).alias("dq_possible_key_source"),
-                 F.min(F.struct(rank, F.col("a__key"), F.col(asy_key_raw).cast("string").alias("raw")))["raw"]
-                  .alias("_best_other_key"),
+                 F.min(F.struct(rank.alias("rank"), F.col("a__key"), *case())).alias("_best_other"),
                  (F.countDistinct("a__key") > 1).alias("dq_multiple_possible_keys")))
 
 
@@ -591,7 +603,8 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
         missing = [c for c in cols.values() if c not in df.columns]
         if missing:
             raise ValueError(f"{name} data is missing required columns: {missing}")
-    clash = [c for c in orr_df.columns if c in (MATCH_FLAG_COL, "matched_a_number", "_ps", "_person", "_best_other_key")
+    clash = [c for c in orr_df.columns if c in (MATCH_FLAG_COL, "matched_a_number", "matched_receipt_number",
+                                             "matched_case_id", "_ps", "_person", "_best_other")
              or c.startswith(("dq_", ASY_PREFIX, "o__", "a__"))]
     if clash:
         raise ValueError(f"ORR columns collide with generated columns: {clash}")
@@ -600,6 +613,7 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
     orr_cols = {**ORR_COLS, "notes": NOTES_COL} if has_notes else ORR_COLS
     asy_cols = {f: ASY_PREFIX + c for f, c in ASY_COLS.items()}
     asy_key_raw = asy_cols["key"]  # The asylum a_id exactly as stored, e.g. asy_a_id
+    carry = [asy_key_raw, asy_cols["receipt"], asy_cols["case_id"]]
     pair_scores, candidates, split_scores = _udfs()
 
     # 1. Normalize both tables (asylum columns prefixed first so names never collide)
@@ -614,21 +628,26 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
 
     # 2 + 5. Attach each row's issues and any other asylum a_ids for the same person
     j = (j.join(_orr_row_issues(o, orr_cols), "o__row_id", "left")
-          .join(_other_keys(o, a, asy_key_raw, candidates, split_scores, has_notes), "o__row_id", "left"))
+          .join(_other_keys(o, a, carry, candidates, split_scores, has_notes), "o__row_id", "left"))
     pke = (F.col("dq_status") == "NO_MATCH") & F.col("dq_possible_asylum_keys").isNotNull()
     j = j.withColumn("dq_status", F.when(pke, "POSSIBLE_KEY_ERROR").otherwise(F.col("dq_status")))
 
     # 6. The key for the full left join later
-    j = j.withColumn("matched_a_number",
-                     F.when(F.col("dq_status") == "POSSIBLE_KEY_ERROR", F.col("_best_other_key"))
-                      .when(matched, _col(asy_key_raw).cast("string"))
-                      .otherwise(_col(ORR_COLS["key"]).cast("string")))
+    # matched_receipt_number / matched_case_id follow the same rules (null for NO_MATCH)
+    is_pke = F.col("dq_status") == "POSSIBLE_KEY_ERROR"
+    best = F.col("_best_other")
+    j = j.withColumns({
+        "matched_a_number": (F.when(is_pke, best["a_id"]).when(matched, _col(asy_key_raw).cast("string"))
+                              .otherwise(_col(ORR_COLS["key"]).cast("string"))),
+        "matched_receipt_number": F.when(is_pke, best["receipt"]).when(matched, _col(carry[1]).cast("string")),
+        "matched_case_id": F.when(is_pke, best["case_id"]).when(matched, _col(carry[2]).cast("string")),
+    })
 
     merged = _cache(j.select(
         *[_col(c) for c in orr_df.columns], *[_col(ASY_PREFIX + c) for c in asylum_df.columns],
-        _col(MATCH_FLAG_COL), "matched_a_number", "dq_status", "dq_match_score", "dq_nonexact_fields",
+        _col(MATCH_FLAG_COL), "matched_a_number", "matched_receipt_number", "matched_case_id", "dq_status", "dq_match_score", "dq_nonexact_fields",
         "dq_resolved_by_notes", "dq_note_best_name", *STATUS.values(), *SIM_COLS.values(),
-        "dq_possible_asylum_keys", "dq_possible_key_source",
+        "dq_possible_asylum_keys", "dq_possible_receipt_numbers", "dq_possible_case_ids", "dq_possible_key_source",
         F.coalesce("dq_multiple_possible_keys", F.lit(False)).alias("dq_multiple_possible_keys"),
         "dq_row_issues"))
 
