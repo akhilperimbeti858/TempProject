@@ -16,12 +16,16 @@ MULTI_ORR = [
     ("900000001", "Lucia", "Flores", "2011-11-11", "F", "Honduras", None),
     # 'fields' hit (900000020) beats a 'notes_name' hit with a lower a_id (900000011)
     ("900000010", "Rafael", "Soto", "2010-05-05", "M", "Mexico", "aka Miguel Angel Rios"),
+    # Typo at the start of the last name in the note (KRUZ vs CRUZ): found via the first-name block
+    # and the full-name score, as in dq_merge.py
+    ("910000001", "Mary", "Smithers", "2012-12-12", "F", "Mexico", "aka Maria Kruz"),
 ]
 MULTI_ASY = [
     ("900000003", "Lucia", "Flores", "2011-11-11", "F", "Honduras", None),
     ("900000002", "Lucia", "Flores", "2011-11-11", "F", "Honduras", None),
     ("900000020", "Rafael", "Soto", "2010-05-05", "M", "Mexico", None),
     ("900000011", "Miguel Angel", "Rios", "2010-05-05", "M", "Mexico", None),
+    ("910000002", "Maria", "Cruz", "2012-12-12", "F", "Mexico", None),
 ]
 
 
@@ -63,6 +67,7 @@ def test_same_results_as_full_script(data, lean_res, case):
     assert got.keys() == expected.keys()
     for k, e in expected.items():
         for col in ("dq_status", "dq_match_score", "dq_resolved_by_notes", "dq_possible_key_source",
+                    "dq_possible_asylum_keys",
                     *lean.STATUS.values(), *lean.SIM_COLS.values()):
             assert got[k][col] == e[col], (k, col, got[k][col], e[col])
 
@@ -124,3 +129,44 @@ def test_missing_receipt_column(spark, data):
     orr, asy = data["base"]
     with pytest.raises(ValueError, match="receipt_number"):
         lean.run_dq_merge(orr, asy.drop("receipt_number"))
+
+
+def notes_of(lean_res, a_id):
+    return by_key(lean_res["notes"]["merged"])[a_id]["dq_all_notes"]
+
+
+def test_all_notes_conflict_reasons(lean_res):
+    n = notes_of(lean_res, "700000004")
+    assert n.startswith("STATUS CONFLICT: DOB disagrees outright (ORR 2009-02-02 vs asylum 2009-12-25)")
+    assert "no date in the notes equals the asylum DOB 2009-12-25" in n
+    n = notes_of(lean_res, "111111111")
+    assert "first and last name both disagree" in n and "below the review threshold" in n
+    assert "FIRST MISMATCH: ORR 'Ann' vs asylum 'Deanna'" in n
+
+
+def test_all_notes_notes_evidence(lean_res):
+    n = notes_of(lean_res, "700000001")
+    assert "resolved by the notes: dob" in n and "DOB backed: the notes contain the asylum DOB 2011-01-02" in n
+    assert "ISSUES MEDIUM:NOTES_DOB_DIFFERS" in n
+    n = notes_of(lean_res, "700000003")
+    assert "best name version 'PEREZ, JUAN' read as first=JUAN last=PEREZ [LAST, FIRST]" in n
+    assert "-> backs first, last" in n
+    n = notes_of(lean_res, "700000010")                       # Two versions: only JUAN LOPEZ is used
+    assert "best name version 'JUAN LOPEZ'" in n and "-> backs first" in n
+
+
+def test_all_notes_other_keys(lean_res):
+    n = notes_of(lean_res, "444444444")
+    assert "STATUS POSSIBLE_KEY_ERROR" in n and "CHOSEN 555555555 (receipt IOE555555555, case C555555555)" in n
+    assert "555555555 via fields: same name + DOB 2008-08-08" in n
+    n = notes_of(lean_res, "700000005")
+    assert "800000005 via notes_name: note name 'JUAN CARLOS PEREZ'" in n and "DOB 2013-06-06" in n
+    n = notes_of(lean_res, "910000001")                       # KRUZ in the note, CRUZ in the asylum table
+    assert "CHOSEN 910000002" in n and "via notes_name: note name 'MARIA KRUZ'" in n
+    assert "MULTIPLE 2 possible cases" in notes_of(lean_res, "900000001")
+
+
+def test_all_notes_simple_rows(lean_res):
+    assert notes_of(lean_res, "333333333").startswith("STATUS NO_MATCH: a_id 333333333 is not in the asylum table")
+    n = notes_of(lean_res, "A012345678")
+    assert n.startswith("STATUS VERIFIED: all fields agree") and "formats differ" in n

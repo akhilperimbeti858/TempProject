@@ -16,6 +16,7 @@ STEPS
     4. _score_matches()     One vectorized rapidfuzz pass per matched row (names + notes), then dq_status.
     5. _other_keys()        Asylum cases with the same person under a different a_id.
     6. matched_a_number     The a_id to use for the later full left join.
+       dq_all_notes         Everything that happened to the row, in words (see _all_notes).
     7. _passed()            Three pass/fail checks in one aggregation pass.
 
 DQ_STATUS
@@ -287,8 +288,9 @@ def _udfs():
 
     pair_scores   One call per matched row: field similarities + the best note name, all at once
                   (dq_merge.py made five separate Python calls per row for the same result).
-    candidates    One call per ORR row with notes: its name splits, as 'first<TAB>last<TAB>text'.
-    split_scores  One call per (note split, asylum case) pair that survived the DOB + soundex blocking.
+    candidates    One call per ORR row with notes: its name splits, as 'first<TAB>last<TAB>text<TAB>layout'.
+    split_scores  One call per (note split, asylum case) pair that survived the DOB + soundex blocking,
+                  scored and ranked exactly like _best_note_name (so the best split can be picked in Spark).
     """
     import pandas as pd
 
@@ -313,17 +315,23 @@ def _udfs():
 
     @F.pandas_udf("array<string>")
     def candidates(notes):
-        return pd.Series([[f"{f}\t{l}\t{t}" for t, f, l, lay in _note_name_candidates(s(n)) if lay != "SINGLE"]
+        return pd.Series([[f"{f or ''}\t{l or ''}\t{t}\t{lay}" for t, f, l, lay in _note_name_candidates(s(n))]
                           for n in notes])
 
-    @F.pandas_udf("struct<first:double,last:double,full:double>")
-    def split_scores(first, last, a_first, a_last, a_full, a_nomid):
+    @F.pandas_udf("struct<rank:double,rank2:double,first:double,last:double,full:double>")
+    def split_scores(first, last, text, layout, a_first, a_last, a_full, a_nomid):
         rows = []
-        for f, l, af, al, afu, anm in zip(first, last, a_first, a_last, a_full, a_nomid):
-            words = f"{f} {l}"
-            rows.append((_jw(f, s(af)), _jw(l, s(al)),
-                         max(_token_sort(words, s(afu)), _token_sort(words, s(anm)))))
-        return pd.DataFrame(rows, columns=["first", "last", "full"])
+        for f, l, t, lay, af, al, afu, anm in zip(first, last, text, layout, a_first, a_last, a_full, a_nomid):
+            af, al, afu, anm = s(af), s(al), s(afu), s(anm)
+            if lay == "SINGLE":  # One word, compared against both first and last, ranked at half
+                fs, ls, full = _jw(t, af), _jw(t, al), 0.0
+                rank = (max(fs, ls) / 2,) * 2
+            else:
+                fs, ls = _jw(f, af), _jw(l, al)
+                full = max(_token_sort(f"{f} {l}", afu), _token_sort(f"{f} {l}", anm))
+                rank = (max((fs + ls) / 2, full), (fs + ls) / 2)
+            rows.append((*rank, fs, ls, full))
+        return pd.DataFrame(rows, columns=["rank", "rank2", "first", "last", "full"])
 
     return pair_scores, candidates, split_scores
 
@@ -469,6 +477,14 @@ def _score_matches(j, matched, pair_scores, has_notes):
                 + [F.when(~s[f].isin(EQUIVALENT), F.lit(f)) for f in others])
     by_notes = [F.when(eff[f] == "NOTES_MATCH", F.lit(f)) for f in ("first", "last", "dob")]
 
+    # Each CONFLICT rule kept separately, so dq_all_notes can say exactly which one fired
+    j = j.withColumns({
+        "_why_dob": F.coalesce(eff["dob"] == "MISMATCH", F.lit(False)),
+        "_why_names": F.coalesce(~full_close & (eff["first"] == "MISMATCH") & (eff["last"] == "MISMATCH"), F.lit(False)),
+        "_why_last": F.coalesce(~full_close & (eff["last"] == "MISMATCH") & (eff["dob"] != "EXACT"), F.lit(False)),
+        "_why_score": F.coalesce(score < REVIEW_THRESHOLD, F.lit(False)),
+        "_eff_dob": eff["dob"],
+    })
     return j.withColumns({
         "dq_match_score": F.when(matched, F.round(score, 3)),
         "dq_status": (F.when(~matched, "NO_MATCH").when(all_ok, "VERIFIED")
@@ -490,13 +506,16 @@ def _other_keys(o, a, carry, candidates, split_scores, has_notes):
 
         fields      ORR name + ORR DOB (exact, in Spark)
         notes_dob   ORR name + a date from the notes (exact, in Spark)
-        notes_name  a name split from the notes + the ORR DOB or a note date, scored with rapidfuzz.
-                    Pairs are blocked first on DOB + soundex of the last name, so Python only scores
-                    plausible pairs. A typo in the first sound of the last name is not found here.
+        notes_name  a name from the notes + the ORR DOB or a note date, scored with rapidfuzz exactly
+                    like dq_merge.py: every split of every name version is scored, the best split per
+                    (ORR row, asylum case) is kept, and it must reach NAME_SIM_MIN on first and last
+                    (or FULL_SIM_MIN on the full name). To keep this fast, a pair is only scored when
+                    the DOB matches and the first OR last name sounds alike (soundex).
 
     `carry` = the asylum columns returned with each hit: [a_id, receipt_number, case_id], as stored.
     Returns one row per ORR row id: the possible cases (three aligned arrays), the sources, the best
-    case (strongest source, then lowest a_id) and whether there was more than one.
+    case (strongest source, then lowest a_id), whether there was more than one, and the evidence per hit.
+    Also returns the note name versions per ORR row (for dq_all_notes), or None without notes.
     """
     asy_key_raw, asy_receipt, asy_case = carry
     keys = lambda tok: [F.array_join(tok, ""), F.array_join(F.array_sort(tok), "")]
@@ -515,29 +534,60 @@ def _other_keys(o, a, carry, candidates, split_scores, has_notes):
                                          F.explode("o__note_dobs").alias("cand_dob"), F.lit("notes_dob").alias("source")))
     by_name = (functools.reduce(lambda x, y: x.unionByName(y), searches)
                .select("*", F.explode(F.array_distinct(F.array(*keys(F.col("o__full_tok"))))).alias("o__name_key")))
+    evidence = F.concat(F.when(F.col("source") == "fields", F.lit("same name + DOB "))
+                         .otherwise(F.lit("ORR name + date from the notes ")), F.col("a__dob").cast("string"))
     hits = [by_name.join(a_keys, (F.col("o__name_key") == F.col("a__name_key"))
                                  & (F.col("cand_dob") == F.col("a__dob")) & other_key)
-                   .select("o__row_id", "a__key", *carry, "source")]
+                   .select("o__row_id", "a__key", *carry, "source", evidence.alias("evidence"))]
+    note_names = None
 
     if has_notes:
         cand_dobs = F.array_distinct(F.filter(F.concat(F.array(F.col("o__dob")), F.col("o__note_dobs")),
                                               lambda d: d.isNotNull()))
-        splits = (o.where(F.col("o__notes").isNotNull())
-                   .select("o__row_id", "o__key", "o__notes", F.explode(cand_dobs).alias("cand_dob"))
-                   .select("o__row_id", "o__key", "cand_dob", F.explode(candidates("o__notes")).alias("_c"))
-                   .select("o__row_id", "o__key", "cand_dob",
-                           F.split("_c", "\t")[0].alias("n_first"), F.split("_c", "\t")[1].alias("n_last"))
-                   .withColumn("_sx", F.soundex(F.regexp_replace("n_last", " ", ""))))
+        part = lambda i: F.split("_c", "\t")[i]
+        # Every name split of every note, once per ORR row (cached: also used for dq_all_notes)
+        splits = _cache(o.where(F.col("o__notes").isNotNull())
+                         .select("o__row_id", "o__key", "o__dob", "o__note_dobs",
+                                 F.explode(candidates("o__notes")).alias("_c"))
+                         .select("o__row_id", "o__key", "o__dob", "o__note_dobs",
+                                 part(0).alias("n_first"), part(1).alias("n_last"),
+                                 part(2).alias("n_text"), part(3).alias("n_layout")))
+        note_names = splits.groupBy("o__row_id").agg(
+            F.array_sort(F.collect_set("n_text")).alias("_note_names"))
+
+        # Block: DOB + soundex of the first name OR the last name (a single word blocks on both)
+        sx = lambda c: F.soundex(F.regexp_replace(c, " ", ""))
+        blocked = (splits.select("*", F.explode(cand_dobs).alias("cand_dob"))
+                         .withColumn("_sx_first", F.when(F.col("n_layout") == "SINGLE", sx("n_text"))
+                                                   .otherwise(sx("n_first")))
+                         .withColumn("_sx_last", F.when(F.col("n_layout") == "SINGLE", sx("n_text"))
+                                                  .otherwise(sx("n_last"))))
+        a_sx = a_ok.withColumn("_asx_first", F.soundex("a__first")).withColumn("_asx_last", F.soundex("a__last"))
+        on = lambda which: ((F.col("cand_dob") == F.col("a__dob")) & other_key
+                            & (F.col(f"_sx_{which}") == F.col(f"_asx_{which}")))
+        split_cols = ["o__row_id", "a__key", "a__dob", "n_first", "n_last", "n_text", "n_layout"]
+        a_words = ["a__first_tok", "a__last_tok", "a__full_tok", "a__nomid_tok"]
+        pairs = (blocked.join(a_sx, on("first")).select(*split_cols, *carry, *a_words)
+                 .unionByName(blocked.join(a_sx, on("last")).select(*split_cols, *carry, *a_words))
+                 .dropDuplicates(["o__row_id", "a__key", "n_text", "n_first", "n_last", "n_layout"]))
         words = lambda c: F.array_join(F.col(c), " ")
-        pairs = splits.join(a_ok.withColumn("_asx", F.soundex("a__last")),
-                            (F.col("cand_dob") == F.col("a__dob")) & (F.col("_sx") == F.col("_asx")) & other_key)
-        sc = F.col("_sc")
-        full_hit = sc["full"] >= FULL_SIM_MIN
-        hits.append(pairs.withColumn("_sc", split_scores("n_first", "n_last", words("a__first_tok"),
-                                                         words("a__last_tok"), words("a__full_tok"),
-                                                         words("a__nomid_tok")))
-                         .where(((sc["first"] >= NAME_SIM_MIN) | full_hit) & ((sc["last"] >= NAME_SIM_MIN) | full_hit))
-                         .select("o__row_id", "a__key", *carry, F.lit("notes_name").alias("source")))
+        scored = pairs.withColumn("_sc", split_scores("n_first", "n_last", "n_text", "n_layout",
+                                                      *[words(c) for c in a_words]))
+        # Best split per (ORR row, asylum case), ranked like _best_note_name, then the thresholds
+        best = (scored.groupBy("o__row_id", "a__key", "a__dob", *carry)
+                      .agg(F.max(F.struct(F.col("_sc.rank").alias("rank"), F.col("_sc.rank2").alias("rank2"),
+                                          F.col("_sc.first").alias("f"), F.col("_sc.last").alias("l"),
+                                          F.col("_sc.full").alias("full"), "n_text", "n_first", "n_last",
+                                          "n_layout")).alias("b")))
+        b = lambda k: F.col("b." + k)
+        full_hit = b("full") >= FULL_SIM_MIN
+        read_as = F.when(b("n_layout") == "SINGLE", F.lit("(one word)")).otherwise(
+            F.format_string("read as first=%s last=%s [%s]", b("n_first"), b("n_last"), b("n_layout")))
+        note_ev = F.format_string("note name '%s' %s + DOB %s (scores %.0f/%.0f/%.0f)", b("n_text"), read_as,
+                                  F.col("a__dob").cast("string"), b("f"), b("l"), b("full"))
+        hits.append(best.where(((b("f") >= NAME_SIM_MIN) | full_hit) & ((b("l") >= NAME_SIM_MIN) | full_hit))
+                        .select("o__row_id", "a__key", *carry, F.lit("notes_name").alias("source"),
+                                note_ev.alias("evidence")))
 
     rank = _lookup(F.col("source"), {k: str(v) for k, v in SOURCE_RANK.items()}).cast("int")
     case = lambda: [F.col(asy_key_raw).cast("string").alias("a_id"), F.col(asy_receipt).cast("string").alias("receipt"),
@@ -545,14 +595,148 @@ def _other_keys(o, a, carry, candidates, split_scores, has_notes):
     # One struct per possible case, sorted by a_id; a case found by several searches appears once
     cases = F.array_sort(F.collect_set(F.struct(*case())))
     field = lambda name: F.transform(cases, lambda c: c[name])
-    return (functools.reduce(lambda x, y: x.unionByName(y), hits)
+    return ((functools.reduce(lambda x, y: x.unionByName(y), hits)
             .groupBy("o__row_id")
             .agg(field("a_id").alias("dq_possible_asylum_keys"),
                  field("receipt").alias("dq_possible_receipt_numbers"),
                  field("case_id").alias("dq_possible_case_ids"),
                  F.array_sort(F.collect_set("source")).alias("dq_possible_key_source"),
                  F.min(F.struct(rank.alias("rank"), F.col("a__key"), *case())).alias("_best_other"),
-                 (F.countDistinct("a__key") > 1).alias("dq_multiple_possible_keys")))
+                 (F.countDistinct("a__key") > 1).alias("dq_multiple_possible_keys"),
+                 F.array_sort(F.collect_set(F.concat(F.col(asy_key_raw).cast("string"), F.lit(" via "),
+                                                     F.col("source"), F.lit(": "), F.col("evidence"))))
+                  .alias("_key_evidence")))), note_names
+
+
+# =============================================================================
+# 6b. dq_all_notes: EVERYTHING THAT HAPPENED TO A ROW, IN WORDS
+# =============================================================================
+
+def _all_notes(matched, has_notes, carry):
+    """One readable string per row, sections separated by ' | ' (split on ' \\| ' to get a list):
+
+        STATUS    the status and exactly why (for CONFLICT: every rule that fired)
+        KEY       which asylum case the a_id matched, and if the a_id formats differed
+        FIRST / LAST / FULL / DOB / SEX / COB   each comparison with both values and the similarity
+        NOTES     dates read, whether they back the asylum DOB, the best name version and what it backs,
+                  and every name version found in the note
+        CHOSEN / ALSO MATCHES / EVIDENCE / MULTIPLE   other asylum a_ids for this person and how found
+        ISSUES    the row's own data problems
+        SCORE     the weighted match score
+    """
+    o = lambda f: F.col("o__" + f)
+    a = lambda f: F.col("a__" + f)
+    v = lambda c: F.coalesce(c.cast("string"), F.lit("(blank)"))           # Never let a null hide a section
+    raw_o = lambda f: v(_col(ORR_COLS[f]))
+    raw_a = lambda f: v(_col(ASY_PREFIX + ASY_COLS[f]))
+    st = lambda f: F.col(STATUS[f])
+    sim = lambda f: F.coalesce(F.format_number(F.col(SIM_COLS[f]), 0), F.lit("n/a"))
+    join = lambda sep, *parts: F.concat_ws(sep, *parts)
+    status = F.col("dq_status")
+    ps = F.col("_ps")
+    has_note = o("notes").isNotNull() if has_notes else F.lit(False)
+    score_txt = F.format_number(F.col("dq_match_score"), 3)
+    listed = lambda arr: F.array_join(arr, ", ")
+
+    # --- STATUS with the reason
+    layouts = F.filter(F.array(*[F.when(st(f).isin(EQUIVALENT) & (st(f) != "EXACT"),
+                                        F.concat(F.lit(f + "="), st(f))) for f in ("first", "last", "full")]),
+                       lambda x: x.isNotNull())
+    reasons = join("; ",
+        F.when(F.col("_why_dob"), F.concat(F.lit("DOB disagrees outright (ORR "), v(o("dob")), F.lit(" vs asylum "),
+                                           v(a("dob")), F.lit(")"),
+                                           F.lit(" and the notes do not contain the asylum DOB" if has_notes else ""))),
+        F.when(F.col("_why_names"), F.concat(F.lit("first and last name both disagree and the full names are not close "
+                                                   "(full similarity "), sim("full"), F.lit(")"))),
+        F.when(F.col("_why_last") & ~F.col("_why_names"),
+               F.concat(F.lit("last name disagrees and the DOB is not an exact match (DOB "), st("dob"), F.lit(")"))),
+        F.when(F.col("_why_score"), F.concat(F.lit("match score "), score_txt,
+                                             F.lit(f" is below the review threshold {REVIEW_THRESHOLD:.2f}"))))
+    n_keys = F.size(F.col("dq_possible_asylum_keys"))
+    status_txt = (
+        F.when(status == "VERIFIED", F.concat(F.lit("STATUS VERIFIED: all fields agree"),
+               F.when(F.size(layouts) > 0, F.concat(F.lit(" (layout differences only: "), listed(layouts), F.lit(")")))
+                .otherwise(F.lit(""))))
+         .when(status == "NEEDS_REVIEW", F.concat(F.lit("STATUS NEEDS_REVIEW: differs in "),
+               listed(F.col("dq_nonexact_fields")),
+               F.when(F.size("dq_resolved_by_notes") > 0,
+                      F.concat(F.lit("; resolved by the notes: "), listed(F.col("dq_resolved_by_notes"))))
+                .otherwise(F.lit("")),
+               F.lit("; minor differences only, score "), score_txt))
+         .when(status == "CONFLICT", F.concat(F.lit("STATUS CONFLICT: "), reasons))
+         .when(status == "POSSIBLE_KEY_ERROR", F.concat(F.lit("STATUS POSSIBLE_KEY_ERROR: a_id "), raw_o("key"),
+               F.lit(" is not in the asylum table, but "), n_keys.cast("string"),
+               F.when(n_keys > 1, F.lit(" possible cases were found")).otherwise(F.lit(" possible case was found"))))
+         .otherwise(F.concat(F.lit("STATUS NO_MATCH: a_id "), raw_o("key"),
+                             F.lit(" is not in the asylum table and no case was found by name + DOB"
+                                   + (", note dates or note names" if has_notes else "")))))
+
+    # --- KEY and the field comparisons (matched rows only)
+    key_txt = F.when(matched, F.concat(
+        F.lit("KEY ORR a_id "), raw_o("key"), F.lit(" matched asylum case "), v(_col(carry[0])),
+        F.lit(" (receipt "), v(_col(carry[1])), F.lit(", case "), v(_col(carry[2])), F.lit(")"),
+        F.when(_col(ORR_COLS["key"]).cast("string") != _col(carry[0]).cast("string"),
+               F.concat(F.lit("; formats differ, matched on the standardized a_id "), o("key"))).otherwise(F.lit(""))))
+    cmp_name = lambda f, label: F.when(matched, F.concat(
+        F.lit(label + " "), st(f), F.lit(": ORR '"), raw_o(f), F.lit("' vs asylum '"), raw_a(f),
+        F.lit("' (similarity "), sim(f), F.lit(")")))
+    full_txt = F.when(matched, F.concat(
+        F.lit("FULL "), st("full"), F.lit(": ORR '"), join(" ", _col(ORR_COLS["first"]), _col(ORR_COLS["last"])),
+        F.lit("' vs asylum '"), join(" ", *[_col(ASY_PREFIX + ASY_COLS[f]) for f in ("first", "middle", "last")
+                                           if f in ASY_COLS]),
+        F.lit("' (similarity "), sim("full"), F.lit(")")))
+    cmp_val = lambda f, label, ov, av: F.when(matched, F.when(st(f) == "EXACT", F.concat(F.lit(label + " EXACT: "), ov))
+        .otherwise(F.concat(F.lit(label + " "), st(f), F.lit(": ORR "), ov, F.lit(" vs asylum "), av)))
+
+    # --- NOTES
+    notes_txt = F.lit(None).cast("string")
+    if has_notes:
+        dates = F.when(F.size(o("note_dobs")) > 0,
+                       F.concat(F.lit("dates read: "), listed(F.transform(o("note_dobs"), lambda d: d.cast("string")))))\
+                 .otherwise(F.lit("no dates in the notes"))
+        dob_txt = F.when(matched & (F.col("_eff_dob") == "NOTES_MATCH"),
+                         F.concat(F.lit("DOB backed: the notes contain the asylum DOB "), v(a("dob"))))\
+                   .when(matched & (st("dob") != "EXACT") & (F.size(o("note_dobs")) > 0),
+                         F.concat(F.lit("no date in the notes equals the asylum DOB "), v(a("dob"))))
+        full_hit = ps["note_full_score"] >= FULL_SIM_MIN
+        backs = F.filter(F.array(F.when((ps["note_first_score"] >= NAME_SIM_MIN) | full_hit, F.lit("first")),
+                                 F.when((ps["note_last_score"] >= NAME_SIM_MIN) | full_hit, F.lit("last"))),
+                         lambda x: x.isNotNull())
+        read_as = F.when(ps["note_layout"] == "SINGLE", F.lit("' (one word), scores ")).otherwise(F.concat(
+            F.lit("' read as first="), v(ps["note_first"]), F.lit(" last="), v(ps["note_last"]),
+            F.lit(" ["), ps["note_layout"], F.lit("], scores ")))
+        best_txt = F.when(matched & ps["note_text"].isNotNull(), F.concat(
+            F.lit("best name version '"), ps["note_text"], read_as,
+            F.format_string("%.0f/%.0f/%.0f", ps["note_first_score"], ps["note_last_score"], ps["note_full_score"]),
+            F.when(F.size(backs) > 0, F.concat(F.lit(" -> backs "), listed(backs)))
+             .otherwise(F.lit(f" -> backs nothing (needs {NAME_SIM_MIN} per name or {FULL_SIM_MIN} full)"))))
+        names_txt = F.when(F.size(F.col("_note_names")) > 0,
+                           F.concat(F.lit("name versions found: "), F.array_join(F.col("_note_names"), "; ")))\
+                     .otherwise(F.lit("no name versions found"))
+        notes_txt = F.when(has_note, F.concat(F.lit("NOTES "), join("; ", dates, dob_txt, best_txt, names_txt)))
+
+    # --- Other asylum a_ids for this person
+    best = F.col("_best_other")
+    best_source = _lookup(best["rank"].cast("string"), {str(r): k for k, r in SOURCE_RANK.items()})
+    has_other = F.col("dq_possible_asylum_keys").isNotNull()
+    case_txt = F.concat(best["a_id"], F.lit(" (receipt "), v(best["receipt"]), F.lit(", case "), v(best["case_id"]),
+                        F.lit("), source "), best_source)
+    other_txt = F.when(has_other & (status == "POSSIBLE_KEY_ERROR"), F.concat(F.lit("CHOSEN "), case_txt))\
+                 .when(has_other, F.concat(F.lit("ALSO MATCHES other asylum case(s) "),
+                                           listed(F.col("dq_possible_asylum_keys")),
+                                           F.lit(" (check for a duplicate case)")))
+    evidence_txt = F.when(has_other, F.concat(F.lit("EVIDENCE "), F.array_join(F.col("_key_evidence"), "; ")))
+    multi_txt = F.when(F.col("dq_multiple_possible_keys"), F.concat(
+        F.lit("MULTIPLE "), n_keys.cast("string"),
+        F.lit(" possible cases; chosen by source (fields > notes_dob > notes_name), then lowest a_id")))
+    issues_txt = F.when(F.size("dq_row_issues") > 0, F.concat(F.lit("ISSUES "), listed(F.col("dq_row_issues"))))
+    score_line = F.when(matched, F.concat(F.lit("SCORE "), score_txt,
+                                          F.lit(f" (CONFLICT below {REVIEW_THRESHOLD:.2f})")))
+
+    return join(" | ", status_txt, key_txt, cmp_name("first", "FIRST"), cmp_name("last", "LAST"), full_txt,
+                cmp_val("dob", "DOB", v(o("dob")), v(a("dob"))), cmp_val("sex", "SEX", v(o("sex")), v(a("sex"))),
+                cmp_val("cob", "COB", v(o("cob")), v(a("cob"))), notes_txt, other_txt, evidence_txt, multi_txt,
+                issues_txt, score_line)
 
 
 # =============================================================================
@@ -604,7 +788,8 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
         if missing:
             raise ValueError(f"{name} data is missing required columns: {missing}")
     clash = [c for c in orr_df.columns if c in (MATCH_FLAG_COL, "matched_a_number", "matched_receipt_number",
-                                             "matched_case_id", "_ps", "_person", "_best_other")
+                                             "matched_case_id", "_ps", "_person", "_best_other",
+                                             "_key_evidence", "_note_names")
              or c.startswith(("dq_", ASY_PREFIX, "o__", "a__"))]
     if clash:
         raise ValueError(f"ORR columns collide with generated columns: {clash}")
@@ -627,8 +812,10 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
     j = _score_matches(j.withColumn(MATCH_FLAG_COL, matched), matched, pair_scores, has_notes)
 
     # 2 + 5. Attach each row's issues and any other asylum a_ids for the same person
-    j = (j.join(_orr_row_issues(o, orr_cols), "o__row_id", "left")
-          .join(_other_keys(o, a, carry, candidates, split_scores, has_notes), "o__row_id", "left"))
+    other_keys, note_names = _other_keys(o, a, carry, candidates, split_scores, has_notes)
+    j = j.join(_orr_row_issues(o, orr_cols), "o__row_id", "left").join(other_keys, "o__row_id", "left")
+    if note_names is not None:
+        j = j.join(note_names, "o__row_id", "left")
     pke = (F.col("dq_status") == "NO_MATCH") & F.col("dq_possible_asylum_keys").isNotNull()
     j = j.withColumn("dq_status", F.when(pke, "POSSIBLE_KEY_ERROR").otherwise(F.col("dq_status")))
 
@@ -643,9 +830,11 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
         "matched_case_id": F.when(is_pke, best["case_id"]).when(matched, _col(carry[2]).cast("string")),
     })
 
+    j = j.withColumn("dq_all_notes", _all_notes(matched, has_notes, carry))
+
     merged = _cache(j.select(
         *[_col(c) for c in orr_df.columns], *[_col(ASY_PREFIX + c) for c in asylum_df.columns],
-        _col(MATCH_FLAG_COL), "matched_a_number", "matched_receipt_number", "matched_case_id", "dq_status", "dq_match_score", "dq_nonexact_fields",
+        _col(MATCH_FLAG_COL), "matched_a_number", "matched_receipt_number", "matched_case_id", "dq_status", "dq_all_notes", "dq_match_score", "dq_nonexact_fields",
         "dq_resolved_by_notes", "dq_note_best_name", *STATUS.values(), *SIM_COLS.values(),
         "dq_possible_asylum_keys", "dq_possible_receipt_numbers", "dq_possible_case_ids", "dq_possible_key_source",
         F.coalesce("dq_multiple_possible_keys", F.lit(False)).alias("dq_multiple_possible_keys"),
