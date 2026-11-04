@@ -40,6 +40,7 @@ REQUIREMENTS
 """
 import functools  # functools.reduce: a notebook "from pyspark.sql.functions import *" shadows bare reduce
 import re
+import sys
 import unicodedata
 from operator import add, and_, or_
 
@@ -283,6 +284,24 @@ def _best_note_name(note, a_first, a_last, a_full, a_nomid):
     return best
 
 
+def _ship_module_with_udfs():
+    """Send this module's code to the Spark workers together with the UDFs.
+
+    By default Spark only sends a reference to the module, and each worker must be able to import
+    dq_merge_lean itself. In a scheduled job (repo files, job clusters, shared or serverless compute)
+    that is not guaranteed and fails with ModuleNotFoundError on the workers. Pickling the module
+    by value removes that dependency. Harmless if it is already pasted into a notebook.
+    """
+    module = sys.modules.get(__name__)
+    if module is None or __name__ == "__main__":
+        return
+    try:
+        from pyspark import cloudpickle
+        cloudpickle.register_pickle_by_value(module)
+    except Exception:  # Older Spark: fall back to the default (module must be importable on workers)
+        pass
+
+
 def _udfs():
     """The three vectorized (pandas) UDFs. Built at call time: importing this file needs no Spark session.
 
@@ -293,6 +312,7 @@ def _udfs():
                   scored and ranked exactly like _best_note_name (so the best split can be picked in Spark).
     """
     import pandas as pd
+    _ship_module_with_udfs()
 
     def s(v):  # Arrow hands over None / NaN for nulls
         return v if isinstance(v, str) and v else None
