@@ -177,15 +177,26 @@ def test_all_notes_simple_rows(lean_res):
 # table gives each dependent its own a_id and links it through principal_a_number.
 DEP_ORR = [
     ("123456789", "Lisa", "Gomez", "1985-04-04", "F", "Honduras"),     # Principal
-    ("123456789A", "Ethan", "Gomez", "2015-06-06", "M", "Honduras"),   # Dependent
-    ("123456789B", "Mia", "Gomez", "2017-07-07", "F", "Honduras"),     # Second dependent
+    ("123456789A", "Ethan", "Gomez", "2015-06-06", "M", "Honduras"),   # Dependents: one family, one case
+    ("123456789B", "Hilde", "Gomez", "2017-07-07", "F", "Honduras"),
+    ("123456789C", "Maria", "Gomez", "2019-09-09", "F", "Honduras"),
     ("A222222229C", "Leo", "Ruiz", "2016-01-01", "M", "Mexico"),       # Principal has no dependents on file
+    # Siblings: C's DOB was mistyped as B's. Picked independently both would take Sofia's case;
+    # one-to-one, C gets Lucas's case (and shows CONFLICT on the DOB, as it should).
+    ("333333339B", "Sofia", "Diaz", "2019-01-01", "F", "Mexico"),
+    ("333333339C", "Lucas", "Diaz", "2019-01-01", "M", "Mexico"),
+    ("333333339D", "Mateo", "Diaz", "2021-03-03", "M", "Mexico"),       # Third ORR dependent, only 2 on file
 ]
 DEP_ASY = [  # a_id, first, last, dob, sex, cob, middle, receipt, case, principal_a_number
-    ("123456789", "Lisa", "Gomez", "1985-04-04", "F", "Honduras", None, "IOE1", "C1", "N/A"),
-    ("987650001", "Ethan", "Gomez", "2015-06-06", "M", "Honduras", None, "IOE2", "C2", "123456789"),
-    ("987650002", "Mia", "Gomez", "2017-07-07", "F", "Honduras", None, "IOE3", "C3", "A-123456789"),
+    # The Gomez family: each person has a unique a_id and receipt, all filed under one case C-FAM
+    ("123456789", "Lisa", "Gomez", "1985-04-04", "F", "Honduras", None, "IOE1", "C-FAM", "N/A"),
+    ("987650001", "Ethan", "Gomez", "2015-06-06", "M", "Honduras", None, "IOE2", "C-FAM", "123456789"),
+    ("987650002", "Hilde", "Gomez", "2017-07-07", "F", "Honduras", None, "IOE3", "C-FAM", "A-123456789"),
+    ("987650003", "Maria", "Gomez", "2019-09-09", "F", "Honduras", None, "IOE8", "C-FAM", "123456789"),
     ("222222229", "Ana", "Ruiz", "1980-02-02", "F", "Mexico", None, "IOE4", "C4", None),
+    ("333333339", "Rosa", "Diaz", "1988-08-08", "F", "Mexico", None, "IOE5", "C5", "N/A"),
+    ("987650011", "Sofia", "Diaz", "2019-01-01", "F", "Mexico", None, "IOE6", "C6", "333333339"),
+    ("987650012", "Lucas", "Diaz", "2020-02-02", "M", "Mexico", None, "IOE7", "C7", "333333339"),
 ]
 
 
@@ -198,16 +209,18 @@ def dep_res(spark):
 
 def test_dependents_matched_through_principal(dep_res):
     m = by_key(dep_res["merged"])
+    family = {"123456789": ("123456789", "IOE1"), "123456789A": ("987650001", "IOE2"),
+              "123456789B": ("987650002", "IOE3"),  # principal_a_number written as 'A-123456789'
+              "123456789C": ("987650003", "IOE8")}
+    for orr_id, (a_number, receipt) in family.items():
+        r = m[orr_id]
+        assert (r["matched_a_number"], r["matched_receipt_number"]) == (a_number, receipt), orr_id
+        assert r["matched_case_id"] == "C-FAM" and r["dq_status"] == "VERIFIED", orr_id
+    assert len({m[k]["matched_a_number"] for k in family}) == 4      # Unique a_ids, one shared case
     r = m["123456789A"]
-    assert (r["matched_a_number"], r["dq_status"]) == ("987650001", "VERIFIED")
-    assert r["matched_receipt_number"] == "IOE2" and r["dq_principal_a_number"] == "123456789"
-    assert r["dq_dependent_candidates"] == 2
-    assert "dependent of principal 123456789: best of 2 asylum case(s)" in r["dq_all_notes"]
-    r = m["123456789B"]                                   # principal_a_number written as 'A-123456789'
-    assert (r["matched_a_number"], r["dq_status"]) == ("987650002", "VERIFIED")
-    r = m["123456789"]                                    # The principal itself is unaffected
-    assert (r["matched_a_number"], r["dq_status"]) == ("123456789", "VERIFIED")
-    assert r["dq_principal_a_number"] is None
+    assert r["dq_principal_a_number"] == "123456789" and r["dq_dependent_candidates"] == 3
+    assert "dependent of principal 123456789: assigned one-to-one among the 3 asylum case(s)" in r["dq_all_notes"]
+    assert m["123456789"]["dq_principal_a_number"] is None             # The principal itself is unaffected
 
 
 def test_dependent_without_case_stays_no_match(dep_res):
@@ -220,3 +233,17 @@ def test_dependent_key_is_not_a_format_issue(dep_res):
     m = by_key(dep_res["merged"])
     assert not any("KEY_FORMAT" in i for i in (m["123456789A"]["dq_row_issues"] or []))
     assert dep_res["passed"] is True
+
+
+def test_dependents_get_unique_a_ids(dep_res):
+    m = by_key(dep_res["merged"])
+    assert m["333333339B"]["matched_a_number"] == "987650011"          # Sofia
+    assert m["333333339B"]["dq_dependent_score"] == 15
+    r = m["333333339C"]                                                 # Lucas, despite the DOB typo
+    assert r["matched_a_number"] == "987650012" and r["dq_dependent_score"] == 7
+    assert r["dq_status"] == "CONFLICT" and "DOB disagrees outright" in r["dq_all_notes"]
+    r = m["333333339D"]                                                 # No case left for a third dependent
+    assert r["dq_status"] == "NO_MATCH" and r["matched_a_number"] == "333333339D"
+    assert "all 2 dependent case(s) under that principal were assigned to other ORR dependents" in r["dq_all_notes"]
+    deps = [r["matched_a_number"] for k, r in m.items() if r["dq_principal_a_number"] and r["dq_status"] != "NO_MATCH"]
+    assert len(deps) == len(set(deps))                                  # Every dependent a_id used once

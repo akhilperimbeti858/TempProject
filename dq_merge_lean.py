@@ -213,43 +213,69 @@ def normalize(df, cols, p):
 # 1b. DEPENDENTS
 # =============================================================================
 
+def _assign_dependents(pdf):
+    """One principal's family: give each ORR dependent its own asylum dependent case, one-to-one.
+
+    pdf holds every (ORR dependent, asylum dependent) pair under one principal with a match score.
+    The strongest pairs are assigned first and each ORR row and each asylum case is used once, so
+    123456789B and 123456789C can never both end up on the same asylum a_id. Ties go to the lower
+    asylum a_id, then the lower ORR a_id letter. ORR dependents left over when the principal has
+    fewer asylum dependents than ORR dependents get no case (they stay NO_MATCH).
+    """
+    import pandas as pd
+    used_rows, used_keys, out = set(), set(), []
+    ranked = pdf.sort_values(["_score", "a__key", "_o_key"], ascending=[False, True, True])
+    for row_id, key, score in zip(ranked["o__row_id"], ranked["a__key"], ranked["_score"]):
+        if row_id not in used_rows and key not in used_keys:
+            used_rows.add(row_id)
+            used_keys.add(key)
+            out.append((row_id, key, int(score)))
+    return pd.DataFrame(out, columns=["o__row_id", "_dep_key", "dq_dependent_score"])
+
+
 def _resolve_dependents(o, a, enabled):
     """Point each ORR dependent at its own asylum case.
 
-    An ORR a_id of 9 digits plus a letter (123456789A) is a dependent of principal 123456789. The asylum
-    table files dependents under their own a_id, with principal_a_number = the principal's a_id. So
-    for each such ORR row, look at the asylum cases with that principal_a_number and take the best one:
-    same DOB first, then same first name, then a first name that sounds alike, then same last name,
-    then the lowest a_id. Its a_id replaces the ORR row's join key (o__key), so the normal join,
-    comparison, notes checks and matched_a_number apply to the dependent unchanged. A wrong pick
-    therefore still shows up as CONFLICT. Without a dependent under that principal the row keeps its
-    key and stays NO_MATCH (or POSSIBLE_KEY_ERROR, if the name + DOB search finds the person).
+    An ORR a_id of 9 digits plus a letter (123456789A, ...B, ...C) is a dependent of principal 123456789.
+    The asylum table files each dependent under its own unique a_id, with principal_a_number = the
+    principal's a_id. The letter does not say WHICH of the principal's dependents it is, so every
+    pair (ORR dependent, asylum dependent under that principal) is scored:
 
-    Adds: o__principal (the principal's canonical a_id, ORR dependents only), dq_dependent_candidates
-    (how many asylum cases list that principal) and dq_principal_a_number (for the output).
+        8 same DOB + 4 same first name + 2 first names sound alike (soundex) + 1 same last name
+
+    and the pairs are assigned one-to-one per principal, strongest first (_assign_dependents). The
+    assigned case's a_id replaces the ORR row's join key (o__key), so the normal join, comparison,
+    notes checks and matched_a_number apply to the dependent unchanged; a doubtful assignment still
+    shows up as CONFLICT. A dependent with no case left under its principal keeps its key and stays
+    NO_MATCH (or POSSIBLE_KEY_ERROR, if the name + DOB search finds the person elsewhere).
+
+    Adds: o__principal (the principal's canonical a_id, ORR dependents only), dq_principal_a_number,
+    dq_dependent_candidates (asylum cases listing that principal) and dq_dependent_score (0-15).
     """
     base = F.regexp_extract(F.col("o__key"), r"^A?([0-9]{8,9})[A-Z]$", 1)
     o = o.withColumn("o__principal", F.when(base != "", F.lpad(base, 9, "0")))
     if not enabled:
         return o.withColumns({"dq_dependent_candidates": F.lit(None).cast("int"),
+                              "dq_dependent_score": F.lit(None).cast("int"),
                               "dq_principal_a_number": F.col("o__principal")})
 
     deps = a.where(F.col("a__principal").isNotNull() & F.col("a__key").isNotNull()).select(
         "a__key", "a__principal", F.col("a__dob").alias("_d_dob"), F.col("a__first").alias("_d_first"),
         F.col("a__last").alias("_d_last"))
     same = lambda x, y: F.coalesce(x == y, F.lit(False)).cast("int")
-    cand = (o.where(F.col("o__principal").isNotNull())
-             .select("o__row_id", "o__principal", "o__dob", "o__first", "o__last")
-             .join(deps, F.col("o__principal") == F.col("a__principal")))
-    by_row = Window.partitionBy("o__row_id")
-    best = (cand.withColumn("_rank", F.row_number().over(by_row.orderBy(
-                    same(F.col("o__dob"), F.col("_d_dob")).desc(), same(F.col("o__first"), F.col("_d_first")).desc(),
-                    same(F.soundex("o__first"), F.soundex("_d_first")).desc(),
-                    same(F.col("o__last"), F.col("_d_last")).desc(), F.col("a__key").asc())))
-                .withColumn("dq_dependent_candidates", F.size(F.collect_set("a__key").over(by_row)))
-                .where("_rank = 1")
-                .select("o__row_id", F.col("a__key").alias("_dep_key"), "dq_dependent_candidates"))
-    return (o.join(best, "o__row_id", "left")
+    pairs = (o.where(F.col("o__principal").isNotNull())
+              .select("o__row_id", F.col("o__key").alias("_o_key"), "o__principal", "o__dob", "o__first", "o__last")
+              .dropDuplicates(["o__row_id"])
+              .join(deps, F.col("o__principal") == F.col("a__principal"))
+              .withColumn("_score", 8 * same(F.col("o__dob"), F.col("_d_dob"))
+                                    + 4 * same(F.col("o__first"), F.col("_d_first"))
+                                    + 2 * same(F.soundex("o__first"), F.soundex("_d_first"))
+                                    + same(F.col("o__last"), F.col("_d_last"))))
+    counts = pairs.groupBy("o__row_id").agg(F.countDistinct("a__key").alias("dq_dependent_candidates"))
+    assigned = (pairs.select("o__principal", "o__row_id", "_o_key", "a__key", "_score")
+                     .groupBy("o__principal")
+                     .applyInPandas(_assign_dependents, "o__row_id long, _dep_key string, dq_dependent_score int"))
+    return (o.join(counts, "o__row_id", "left").join(assigned, "o__row_id", "left")
              .withColumn("o__key", F.coalesce("_dep_key", "o__key"))
              .withColumn("dq_principal_a_number", F.col("o__principal"))
              .drop("_dep_key"))
@@ -743,7 +769,11 @@ def _all_notes(matched, has_notes, carry):
          .otherwise(F.concat(F.lit("STATUS NO_MATCH: a_id "), raw_o("key"),
                              F.lit(" is not in the asylum table and no case was found by name + DOB"
                                    + (", note dates or note names" if has_notes else "")),
-                             F.when(o("principal").isNotNull(), F.concat(
+                             F.when(o("principal").isNotNull() & (F.col("dq_dependent_candidates") > 0), F.concat(
+                                 F.lit("; it is a dependent of principal "), o("principal"), F.lit(", but all "),
+                                 F.col("dq_dependent_candidates").cast("string"),
+                                 F.lit(" dependent case(s) under that principal were assigned to other ORR dependents")))
+                              .when(o("principal").isNotNull(), F.concat(
                                  F.lit("; it is a dependent of principal "), o("principal"),
                                  F.lit(", but no asylum case lists that principal_a_number")))
                               .otherwise(F.lit("")))))
@@ -753,9 +783,10 @@ def _all_notes(matched, has_notes, carry):
         F.lit("KEY ORR a_id "), raw_o("key"), F.lit(" matched asylum case "), v(_col(carry[0])),
         F.lit(" (receipt "), v(_col(carry[1])), F.lit(", case "), v(_col(carry[2])), F.lit(")"),
         F.when(o("principal").isNotNull(), F.concat(
-            F.lit("; dependent of principal "), o("principal"), F.lit(": best of "),
+            F.lit("; dependent of principal "), o("principal"), F.lit(": assigned one-to-one among the "),
             F.col("dq_dependent_candidates").cast("string"),
-            F.lit(" asylum case(s) with that principal_a_number, chosen by DOB and name")))
+            F.lit(" asylum case(s) with that principal_a_number, dependent score "),
+            F.col("dq_dependent_score").cast("string"), F.lit("/15 (8 DOB, 4 first name, 2 sound, 1 last name)")))
          .when(_col(ORR_COLS["key"]).cast("string") != _col(carry[0]).cast("string"),
                F.concat(F.lit("; formats differ, matched on the standardized a_id "), o("key"))).otherwise(F.lit(""))))
     cmp_name = lambda f, label: F.when(matched, F.concat(
@@ -919,7 +950,7 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
     merged = _cache(j.select(
         *[_col(c) for c in orr_df.columns], *[_col(ASY_PREFIX + c) for c in asylum_df.columns],
         _col(MATCH_FLAG_COL), "matched_a_number", "matched_receipt_number", "matched_case_id", "dq_principal_a_number",
-        "dq_dependent_candidates", "dq_status", "dq_all_notes", "dq_match_score", "dq_nonexact_fields",
+        "dq_dependent_candidates", "dq_dependent_score", "dq_status", "dq_all_notes", "dq_match_score", "dq_nonexact_fields",
         "dq_resolved_by_notes", "dq_note_best_name", *STATUS.values(), *SIM_COLS.values(),
         "dq_possible_asylum_keys", "dq_possible_receipt_numbers", "dq_possible_case_ids", "dq_possible_key_source",
         F.coalesce("dq_multiple_possible_keys", F.lit(False)).alias("dq_multiple_possible_keys"),
