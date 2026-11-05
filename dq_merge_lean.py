@@ -11,6 +11,7 @@ Same matching as dq_merge.py, trimmed to what produces the merged table:
 
 STEPS
     1. normalize()          Clean each comparison field into a helper column (o__* / a__*).
+       _resolve_dependents()  ORR dependents (123456789A) -> their own asylum case via principal_a_number.
     2. _orr_row_issues()    Single-table problems of each ORR row -> dq_row_issues.
     3. LEFT join            ORR to asylum on the canonical a_id. No ORR row is dropped.
     4. _score_matches()     One vectorized rapidfuzz pass per matched row (names + notes), then dq_status.
@@ -44,7 +45,7 @@ import sys
 import unicodedata
 from operator import add, and_, or_
 
-from pyspark.sql import DataFrame, functions as F
+from pyspark.sql import DataFrame, Window, functions as F
 
 
 # =============================================================================
@@ -57,12 +58,16 @@ ORR_COLS = {"key": "a_id", "first": "first_name", "last": "last_name",
 # possible matches (dq_possible_receipt_numbers, matched_case_id, ...).
 ASY_COLS = {**ORR_COLS, "middle": "middle_name", "receipt": "receipt_number", "case_id": "case_id"}
 NOTES_COL = "additional_notes"                     # Optional ORR free-text column
+# Dependents: in the ORR data a dependent's a_id is the principal's a_id plus a letter (123456789A).
+# The asylum table gives dependents their own a_id and links them through this column ('N/A' for
+# principals). Optional: without it, dependents are not resolved.
+PRINCIPAL_COL = "principal_a_number"
 ASY_PREFIX = "asy_"                                # Prefix for asylum columns in the output
 MATCH_FLAG_COL = "asylum_case_exists"
 CACHE = True                                       # Set False on serverless, where persist() is unsupported
 
 # Cleaning
-KEY_PATTERN = r"^A?[0-9]{8,9}$"
+KEY_PATTERN = r"^A?[0-9]{8,9}[A-Z]?$"   # A trailing letter marks a dependent
 DOB_FORMATS = ["yyyy-MM-dd", "M/d/yyyy", "yyyyMMdd", "yyyy-MM-dd HH:mm:ss"]
 MIN_DOB = "1900-01-01"
 NULL_TOKENS = ["", "NULL", "NONE", "N/A", "NA", "NAN", "?", "-"]
@@ -198,8 +203,56 @@ def normalize(df, cols, p):
         rules["middle"] = _compact(mid)
         rules["full_tok"] = _tokens(raw("first"), mid, raw("last"))
         rules["init_tok"] = _tokens(raw("first"), F.substring(_compact(mid), 1, 1), raw("last"))
+    if "principal" in cols:  # Asylum: the principal's a_id for dependents ('N/A' -> null)
+        rules["principal"] = _key(raw("principal"), dt[cols["principal"]])
     row_id = F.xxhash64(*[_col(c) for c in df.columns])
     return df.select("*", row_id.alias(p + "row_id"), *[e.alias(p + f) for f, e in rules.items()])
+
+
+# =============================================================================
+# 1b. DEPENDENTS
+# =============================================================================
+
+def _resolve_dependents(o, a, enabled):
+    """Point each ORR dependent at its own asylum case.
+
+    An ORR a_id of 9 digits plus a letter (123456789A) is a dependent of principal 123456789. The asylum
+    table files dependents under their own a_id, with principal_a_number = the principal's a_id. So
+    for each such ORR row, look at the asylum cases with that principal_a_number and take the best one:
+    same DOB first, then same first name, then a first name that sounds alike, then same last name,
+    then the lowest a_id. Its a_id replaces the ORR row's join key (o__key), so the normal join,
+    comparison, notes checks and matched_a_number apply to the dependent unchanged. A wrong pick
+    therefore still shows up as CONFLICT. Without a dependent under that principal the row keeps its
+    key and stays NO_MATCH (or POSSIBLE_KEY_ERROR, if the name + DOB search finds the person).
+
+    Adds: o__principal (the principal's canonical a_id, ORR dependents only), dq_dependent_candidates
+    (how many asylum cases list that principal) and dq_principal_a_number (for the output).
+    """
+    base = F.regexp_extract(F.col("o__key"), r"^A?([0-9]{8,9})[A-Z]$", 1)
+    o = o.withColumn("o__principal", F.when(base != "", F.lpad(base, 9, "0")))
+    if not enabled:
+        return o.withColumns({"dq_dependent_candidates": F.lit(None).cast("int"),
+                              "dq_principal_a_number": F.col("o__principal")})
+
+    deps = a.where(F.col("a__principal").isNotNull() & F.col("a__key").isNotNull()).select(
+        "a__key", "a__principal", F.col("a__dob").alias("_d_dob"), F.col("a__first").alias("_d_first"),
+        F.col("a__last").alias("_d_last"))
+    same = lambda x, y: F.coalesce(x == y, F.lit(False)).cast("int")
+    cand = (o.where(F.col("o__principal").isNotNull())
+             .select("o__row_id", "o__principal", "o__dob", "o__first", "o__last")
+             .join(deps, F.col("o__principal") == F.col("a__principal")))
+    by_row = Window.partitionBy("o__row_id")
+    best = (cand.withColumn("_rank", F.row_number().over(by_row.orderBy(
+                    same(F.col("o__dob"), F.col("_d_dob")).desc(), same(F.col("o__first"), F.col("_d_first")).desc(),
+                    same(F.soundex("o__first"), F.soundex("_d_first")).desc(),
+                    same(F.col("o__last"), F.col("_d_last")).desc(), F.col("a__key").asc())))
+                .withColumn("dq_dependent_candidates", F.size(F.collect_set("a__key").over(by_row)))
+                .where("_rank = 1")
+                .select("o__row_id", F.col("a__key").alias("_dep_key"), "dq_dependent_candidates"))
+    return (o.join(best, "o__row_id", "left")
+             .withColumn("o__key", F.coalesce("_dep_key", "o__key"))
+             .withColumn("dq_principal_a_number", F.col("o__principal"))
+             .drop("_dep_key"))
 
 
 # =============================================================================
@@ -689,13 +742,21 @@ def _all_notes(matched, has_notes, carry):
                F.when(n_keys > 1, F.lit(" possible cases were found")).otherwise(F.lit(" possible case was found"))))
          .otherwise(F.concat(F.lit("STATUS NO_MATCH: a_id "), raw_o("key"),
                              F.lit(" is not in the asylum table and no case was found by name + DOB"
-                                   + (", note dates or note names" if has_notes else "")))))
+                                   + (", note dates or note names" if has_notes else "")),
+                             F.when(o("principal").isNotNull(), F.concat(
+                                 F.lit("; it is a dependent of principal "), o("principal"),
+                                 F.lit(", but no asylum case lists that principal_a_number")))
+                              .otherwise(F.lit("")))))
 
     # --- KEY and the field comparisons (matched rows only)
     key_txt = F.when(matched, F.concat(
         F.lit("KEY ORR a_id "), raw_o("key"), F.lit(" matched asylum case "), v(_col(carry[0])),
         F.lit(" (receipt "), v(_col(carry[1])), F.lit(", case "), v(_col(carry[2])), F.lit(")"),
-        F.when(_col(ORR_COLS["key"]).cast("string") != _col(carry[0]).cast("string"),
+        F.when(o("principal").isNotNull(), F.concat(
+            F.lit("; dependent of principal "), o("principal"), F.lit(": best of "),
+            F.col("dq_dependent_candidates").cast("string"),
+            F.lit(" asylum case(s) with that principal_a_number, chosen by DOB and name")))
+         .when(_col(ORR_COLS["key"]).cast("string") != _col(carry[0]).cast("string"),
                F.concat(F.lit("; formats differ, matched on the standardized a_id "), o("key"))).otherwise(F.lit(""))))
     cmp_name = lambda f, label: F.when(matched, F.concat(
         F.lit(label + " "), st(f), F.lit(": ORR '"), raw_o(f), F.lit("' vs asylum '"), raw_a(f),
@@ -808,7 +869,7 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
         if missing:
             raise ValueError(f"{name} data is missing required columns: {missing}")
     clash = [c for c in orr_df.columns if c in (MATCH_FLAG_COL, "matched_a_number", "matched_receipt_number",
-                                             "matched_case_id", "_ps", "_person", "_best_other",
+                                             "matched_case_id", "_ps", "_person", "_best_other", "_dep_key",
                                              "_key_evidence", "_note_names")
              or c.startswith(("dq_", ASY_PREFIX, "o__", "a__"))]
     if clash:
@@ -816,7 +877,8 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
 
     has_notes = NOTES_COL in orr_df.columns
     orr_cols = {**ORR_COLS, "notes": NOTES_COL} if has_notes else ORR_COLS
-    asy_cols = {f: ASY_PREFIX + c for f, c in ASY_COLS.items()}
+    asy_map = {**ASY_COLS, "principal": PRINCIPAL_COL} if PRINCIPAL_COL in asylum_df.columns else ASY_COLS
+    asy_cols = {f: ASY_PREFIX + c for f, c in asy_map.items()}
     asy_key_raw = asy_cols["key"]  # The asylum a_id exactly as stored, e.g. asy_a_id
     carry = [asy_key_raw, asy_cols["receipt"], asy_cols["case_id"]]
     pair_scores, candidates, split_scores = _udfs()
@@ -825,6 +887,8 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
     o = _cache(normalize(orr_df, orr_cols, "o__"))
     a = _cache(normalize(asylum_df.select([_col(c).alias(ASY_PREFIX + c) for c in asylum_df.columns]),
                          asy_cols, "a__"))
+    # 1b. ORR dependents (123456789A) -> their own asylum case, found through principal_a_number
+    o = _cache(_resolve_dependents(o, a, enabled="principal" in asy_cols))
 
     # 3-4. LEFT join on the canonical a_id, then score the matched pairs
     j = o.join(a.where(F.col("a__key").isNotNull()), F.col("o__key") == F.col("a__key"), "left")
@@ -854,7 +918,8 @@ def run_dq_merge(orr_df: DataFrame, asylum_df: DataFrame) -> dict:
 
     merged = _cache(j.select(
         *[_col(c) for c in orr_df.columns], *[_col(ASY_PREFIX + c) for c in asylum_df.columns],
-        _col(MATCH_FLAG_COL), "matched_a_number", "matched_receipt_number", "matched_case_id", "dq_status", "dq_all_notes", "dq_match_score", "dq_nonexact_fields",
+        _col(MATCH_FLAG_COL), "matched_a_number", "matched_receipt_number", "matched_case_id", "dq_principal_a_number",
+        "dq_dependent_candidates", "dq_status", "dq_all_notes", "dq_match_score", "dq_nonexact_fields",
         "dq_resolved_by_notes", "dq_note_best_name", *STATUS.values(), *SIM_COLS.values(),
         "dq_possible_asylum_keys", "dq_possible_receipt_numbers", "dq_possible_case_ids", "dq_possible_key_source",
         F.coalesce("dq_multiple_possible_keys", F.lit(False)).alias("dq_multiple_possible_keys"),

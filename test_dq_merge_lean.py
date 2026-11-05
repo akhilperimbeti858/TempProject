@@ -40,7 +40,8 @@ def asylum(spark, rows):
     """Asylum fixture rows plus receipt_number / case_id derived from the a_id."""
     return (spark.createDataFrame(rows, ASY_SCHEMA)
             .withColumn("receipt_number", F.concat(F.lit("IOE"), "a_id"))
-            .withColumn("case_id", F.concat(F.lit("C"), "a_id")))
+            .withColumn("case_id", F.concat(F.lit("C"), "a_id"))
+            .withColumn("principal_a_number", F.lit("N/A")))
 
 
 @pytest.fixture(scope="session")
@@ -170,3 +171,52 @@ def test_all_notes_simple_rows(lean_res):
     assert notes_of(lean_res, "333333333").startswith("STATUS NO_MATCH: a_id 333333333 is not in the asylum table")
     n = notes_of(lean_res, "A012345678")
     assert n.startswith("STATUS VERIFIED: all fields agree") and "formats differ" in n
+
+
+# Principal + dependents. ORR marks a dependent with the principal's a_id plus a letter; the asylum
+# table gives each dependent its own a_id and links it through principal_a_number.
+DEP_ORR = [
+    ("123456789", "Lisa", "Gomez", "1985-04-04", "F", "Honduras"),     # Principal
+    ("123456789A", "Ethan", "Gomez", "2015-06-06", "M", "Honduras"),   # Dependent
+    ("123456789B", "Mia", "Gomez", "2017-07-07", "F", "Honduras"),     # Second dependent
+    ("A222222229C", "Leo", "Ruiz", "2016-01-01", "M", "Mexico"),       # Principal has no dependents on file
+]
+DEP_ASY = [  # a_id, first, last, dob, sex, cob, middle, receipt, case, principal_a_number
+    ("123456789", "Lisa", "Gomez", "1985-04-04", "F", "Honduras", None, "IOE1", "C1", "N/A"),
+    ("987650001", "Ethan", "Gomez", "2015-06-06", "M", "Honduras", None, "IOE2", "C2", "123456789"),
+    ("987650002", "Mia", "Gomez", "2017-07-07", "F", "Honduras", None, "IOE3", "C3", "A-123456789"),
+    ("222222229", "Ana", "Ruiz", "1980-02-02", "F", "Mexico", None, "IOE4", "C4", None),
+]
+
+
+@pytest.fixture(scope="session")
+def dep_res(spark):
+    asy = spark.createDataFrame(DEP_ASY, ASY_SCHEMA + ", receipt_number string, case_id string, "
+                                                     "principal_a_number string")
+    return lean.run_dq_merge(spark.createDataFrame(DEP_ORR, ORR_SCHEMA), asy)
+
+
+def test_dependents_matched_through_principal(dep_res):
+    m = by_key(dep_res["merged"])
+    r = m["123456789A"]
+    assert (r["matched_a_number"], r["dq_status"]) == ("987650001", "VERIFIED")
+    assert r["matched_receipt_number"] == "IOE2" and r["dq_principal_a_number"] == "123456789"
+    assert r["dq_dependent_candidates"] == 2
+    assert "dependent of principal 123456789: best of 2 asylum case(s)" in r["dq_all_notes"]
+    r = m["123456789B"]                                   # principal_a_number written as 'A-123456789'
+    assert (r["matched_a_number"], r["dq_status"]) == ("987650002", "VERIFIED")
+    r = m["123456789"]                                    # The principal itself is unaffected
+    assert (r["matched_a_number"], r["dq_status"]) == ("123456789", "VERIFIED")
+    assert r["dq_principal_a_number"] is None
+
+
+def test_dependent_without_case_stays_no_match(dep_res):
+    r = by_key(dep_res["merged"])["A222222229C"]
+    assert r["dq_status"] == "NO_MATCH" and r["matched_a_number"] == "A222222229C"
+    assert "dependent of principal 222222229, but no asylum case lists that principal_a_number" in r["dq_all_notes"]
+
+
+def test_dependent_key_is_not_a_format_issue(dep_res):
+    m = by_key(dep_res["merged"])
+    assert not any("KEY_FORMAT" in i for i in (m["123456789A"]["dq_row_issues"] or []))
+    assert dep_res["passed"] is True
