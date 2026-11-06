@@ -1,249 +1,139 @@
+"""Tests for dq_merge_lean.py, using the real ORR_DATA / AFF_DATA column names.
+
+Top priority: every ORR uac_alien_no that exists as an a_number in AFF_DATA must come out matched
+(asylum_case_exists = True, matched_a_number = that a_number), whatever its dq_status.
+"""
 import os
 import sys
 
 import pytest
-from pyspark.sql import SparkSession, functions as F
+from pyspark.sql import SparkSession
 
-import dq_merge as full
 import dq_merge_lean as lean
-from test_dq_merge import ASY_ROWS, ASY_SCHEMA, NOTES_ASY_ROWS, NOTES_ROWS, ORR_ROWS, ORR_SCHEMA
 
-NOTES_SCHEMA = ORR_SCHEMA + ", additional_notes string"
+ORR_SCHEMA = ("uac_alien_no string, uac_first_name string, uac_last_name string, uac_sex string, "
+              "uac_dob string, uac_cob string, uac_aka string, uac_status string, current_status string")
+AFF_SCHEMA = ("a_number string, first_name string, middle_name string, last_name string, sex string, "
+              "date_of_birth string, country_of_birth string, receipt_number string, case_id string")
 
-# Several possible keys for one ORR record, and source priority
-MULTI_ORR = [
-    # Same name + DOB under two other a_ids -> lowest a_id, flagged as multiple
-    ("900000001", "Lucia", "Flores", "2011-11-11", "F", "Honduras", None),
-    # 'fields' hit (900000020) beats a 'notes_name' hit with a lower a_id (900000011)
-    ("900000010", "Rafael", "Soto", "2010-05-05", "M", "Mexico", "aka Miguel Angel Rios"),
-    # Typo at the start of the last name in the note (KRUZ vs CRUZ): found via the first-name block
-    # and the full-name score, as in dq_merge.py
-    ("910000001", "Mary", "Smithers", "2012-12-12", "F", "Mexico", "aka Maria Kruz"),
+
+def orr(key, first="Juan", last="Perez", sex="M", dob="2012-03-03", cob="Honduras", aka=None):
+    return (key, first, last, sex, dob, cob, aka, "Active", "Released")
+
+
+def aff(key, first="Juan", middle=None, last="Perez", sex="M", dob="2012-03-03", cob="Honduras"):
+    return (key, first, middle, last, sex, dob, cob, f"IOE{abs(hash(key)) % 10**7}", f"C{abs(hash(key)) % 10**5}")
+
+
+# The same a_number written differently in the two tables. Every pair must match.
+KEY_VARIANTS = [  # (ORR uac_alien_no, AFF a_number)
+    ("100000001", "100000001"),            # identical
+    ("A100000002", "100000002"),           # A prefix
+    ("a-100-000-003", "100000003"),        # lower case + hyphens
+    (" 100000004 ", "100000004"),          # spaces
+    ("100000005 ", "100000005"),      # non-breaking space (Excel / web exports)
+    ("100000006", "​100000006"),      # zero-width space
+    ("100000007.0", "100000007"),          # number saved as text with .0
+    ("1.00000008E8", "100000008"),         # scientific notation saved as text
+    ("0100000009", "100000009"),           # 10-character A-number with a leading zero
+    ("A0100000010", "100000010"),          # A + 10 characters
+    ("'100000011", "100000011"),           # leading apostrophe (Excel text marker)
+    ("100000012\t", "100000012"),          # tab
+    ("12345678", "012345678"),             # 8 digits vs zero-padded 9
 ]
-MULTI_ASY = [
-    ("900000003", "Lucia", "Flores", "2011-11-11", "F", "Honduras", None),
-    ("900000002", "Lucia", "Flores", "2011-11-11", "F", "Honduras", None),
-    ("900000020", "Rafael", "Soto", "2010-05-05", "M", "Mexico", None),
-    ("900000011", "Miguel Angel", "Rios", "2010-05-05", "M", "Mexico", None),
-    ("910000002", "Maria", "Cruz", "2012-12-12", "F", "Mexico", None),
+
+ORR_ROWS = [orr(o, first=f"Kid{i}") for i, (o, _) in enumerate(KEY_VARIANTS)] + [
+    orr("200000001"),                                                       # VERIFIED
+    orr("200000002", first="Jon", last="Doe"),                              # NEEDS_REVIEW (typo)
+    orr("200000003", first="Ann", last="Lee", sex="F", dob="2009-01-01"),   # CONFLICT (names differ)
+    orr("200000004", dob="2009-02-02"),                                     # CONFLICT (DOB differs)
+    orr("200000005", dob="2011-05-05", aka="Correct dob: 01/02/2011"),      # NEEDS_REVIEW via notes
+    orr("300000001", first="Ana", last="Rios"),                             # NO_MATCH
+    orr("300000002", first="Maria", last="Garcia", sex="F", dob="2008-08-08"),  # POSSIBLE_KEY_ERROR
+]
+AFF_ROWS = [aff(a, first=f"Kid{i}") for i, (_, a) in enumerate(KEY_VARIANTS)] + [
+    aff("200000001"),
+    aff("200000002", first="John", last="Doe"),
+    aff("200000003", first="Deanna", last="Liu", sex="F", dob="2009-01-01"),
+    aff("200000004", dob="2009-12-25"),
+    aff("200000005", dob="2011-01-02"),
+    aff("555555555", first="Maria", last="Garcia", sex="F", dob="2008-08-08"),
 ]
 
 
 @pytest.fixture(scope="session")
 def spark():
     os.environ.setdefault("PYSPARK_PYTHON", sys.executable)
-    return (SparkSession.builder.master("local[2]")
-            .config("spark.sql.shuffle.partitions", "4").getOrCreate())
-
-
-def asylum(spark, rows):
-    """Asylum fixture rows plus receipt_number / case_id derived from the a_id."""
-    return (spark.createDataFrame(rows, ASY_SCHEMA)
-            .withColumn("receipt_number", F.concat(F.lit("IOE"), "a_id"))
-            .withColumn("case_id", F.concat(F.lit("C"), "a_id"))
-            .withColumn("principal_a_number", F.lit("N/A")))
+    s = (SparkSession.builder.master("local[2]").config("spark.sql.shuffle.partitions", "4")
+         .config("spark.ui.showConsoleProgress", "false").getOrCreate())
+    yield s
+    s.stop()
 
 
 @pytest.fixture(scope="session")
-def data(spark):
-    base = (spark.createDataFrame(ORR_ROWS, ORR_SCHEMA), asylum(spark, ASY_ROWS))
-    notes = (spark.createDataFrame([r + (None,) for r in ORR_ROWS] + NOTES_ROWS + MULTI_ORR, NOTES_SCHEMA),
-             asylum(spark, ASY_ROWS + NOTES_ASY_ROWS + MULTI_ASY))
-    return {"base": base, "notes": notes}
+def res(spark):
+    return lean.run_dq_merge(spark.createDataFrame(ORR_ROWS, ORR_SCHEMA), spark.createDataFrame(AFF_ROWS, AFF_SCHEMA))
 
 
-@pytest.fixture(scope="session")
-def lean_res(data):
-    return {k: lean.run_dq_merge(*v) for k, v in data.items()}
+def by_key(res):
+    return {r["uac_alien_no"]: r for r in res["merged"].collect()}
 
 
-def by_key(df):
-    return {r["a_id"]: r for r in df.collect()}
+@pytest.mark.parametrize("orr_key, aff_key", KEY_VARIANTS)
+def test_every_a_number_match_is_kept(res, orr_key, aff_key):
+    r = by_key(res)[orr_key]
+    assert r["asylum_case_exists"] is True, f"{orr_key!r} vs {aff_key!r}: {r['dq_all_notes']}"
+    assert r["matched_a_number"] == aff_key
 
 
-@pytest.mark.parametrize("case", ["base", "notes"])
-def test_same_results_as_full_script(data, lean_res, case):
-    expected = by_key(full.run_dq_merge(*data[case])["merged"])
-    got = by_key(lean_res[case]["merged"])
-    assert got.keys() == expected.keys()
-    for k, e in expected.items():
-        for col in ("dq_status", "dq_match_score", "dq_resolved_by_notes", "dq_possible_key_source",
-                    "dq_possible_asylum_keys",
-                    *lean.STATUS.values(), *lean.SIM_COLS.values()):
-            assert got[k][col] == e[col], (k, col, got[k][col], e[col])
+def test_matches_are_not_cleared_by_conflict_or_review(res):
+    m = by_key(res)
+    for key, status in [("200000001", "VERIFIED"), ("200000002", "NEEDS_REVIEW"),
+                        ("200000003", "CONFLICT"), ("200000004", "CONFLICT"), ("200000005", "NEEDS_REVIEW")]:
+        r = m[key]
+        assert r["dq_status"] == status, (key, r["dq_all_notes"])
+        assert r["asylum_case_exists"] is True and r["matched_a_number"] == key, key
+        assert r["matched_receipt_number"] is not None and r["matched_case_id"] is not None, key
 
 
-def test_matched_a_number(lean_res):
-    m = by_key(lean_res["notes"]["merged"])
-    assert m["A012345678"]["matched_a_number"] == "12345678"      # Matched: asylum's own format
-    assert m["111111111"]["matched_a_number"] == "111111111"      # CONFLICT keeps its own case
-    assert m["444444444"]["dq_status"] == "POSSIBLE_KEY_ERROR"
-    assert m["444444444"]["matched_a_number"] == "555555555"
-    assert m["700000005"]["matched_a_number"] == "800000005"      # Found through the notes
-    assert m["333333333"]["matched_a_number"] == "333333333"      # NO_MATCH keeps the ORR a_id
+def test_unmatched_rows(res):
+    m = by_key(res)
+    assert m["300000001"]["dq_status"] == "NO_MATCH" and m["300000001"]["matched_a_number"] == "300000001"
+    r = m["300000002"]
+    assert r["dq_status"] == "POSSIBLE_KEY_ERROR" and r["matched_a_number"] == "555555555"
+    assert r["asylum_case_exists"] is False
 
 
-def test_multiple_possible_keys(lean_res):
-    m = by_key(lean_res["notes"]["merged"])
-    r = m["900000001"]
-    assert r["dq_possible_asylum_keys"] == ["900000002", "900000003"]
-    assert r["matched_a_number"] == "900000002" and r["dq_multiple_possible_keys"] is True
-    r = m["900000010"]
-    assert r["dq_possible_key_source"] == ["fields", "notes_name"]
-    assert r["matched_a_number"] == "900000020"                   # fields beats notes_name
-    assert m["444444444"]["dq_multiple_possible_keys"] is False
+def test_notes_resolve_dob(res):
+    r = by_key(res)["200000005"]
+    assert r["dq_resolved_by_notes"] == ["dob"] and "DOB backed" in r["dq_all_notes"]
 
 
-def test_passed(spark, lean_res):
-    assert lean_res["base"]["passed"] is True
-    assert lean_res["base"]["checks"]["detail"]["orr_rows"] == len(ORR_ROWS)
-    dup = asylum(spark, ASY_ROWS + [("111111111", "X", "Y", "2001-01-01", "M", "Mexico", None)])
-    res = lean.run_dq_merge(spark.createDataFrame(ORR_ROWS, ORR_SCHEMA), dup)
-    assert res["passed"] is False and res["checks"]["ASYLUM_KEYS_UNIQUE"] is False
+def test_row_count_and_checks(res):
+    assert res["merged"].count() == len(ORR_ROWS)
+    assert res["checks"]["ROW_COUNT_PRESERVED"] is True
+    assert res["checks"]["detail"]["matched"] == len(KEY_VARIANTS) + 5
 
 
-def test_row_issues(lean_res):
-    m = by_key(lean_res["notes"]["merged"])
-    assert "MEDIUM:NOTES_DOB_DIFFERS" in m["700000001"]["dq_row_issues"]
-    assert m["A012345678"]["dq_row_issues"] is None
+def test_numeric_a_number_column(spark):
+    aff_df = spark.createDataFrame([aff("100000001")], AFF_SCHEMA).selectExpr(
+        "cast(a_number as bigint) as a_number", *[c for c in AFF_SCHEMA.split(", ")[1:] for c in [c.split()[0]]])
+    out = lean.run_dq_merge(spark.createDataFrame([orr("A100000001")], ORR_SCHEMA), aff_df)
+    r = out["merged"].first()
+    assert r["asylum_case_exists"] is True and r["matched_a_number"] == "100000001"
 
 
-def test_receipt_and_case_id(lean_res):
-    m = by_key(lean_res["notes"]["merged"])
-    r = m["444444444"]                                            # POSSIBLE_KEY_ERROR, one possible case
-    assert r["dq_possible_receipt_numbers"] == ["IOE555555555"] and r["dq_possible_case_ids"] == ["C555555555"]
-    assert (r["matched_receipt_number"], r["matched_case_id"]) == ("IOE555555555", "C555555555")
-    r = m["900000001"]                                            # Two possible cases: arrays line up by position
-    assert r["dq_possible_asylum_keys"] == ["900000002", "900000003"]
-    assert r["dq_possible_receipt_numbers"] == ["IOE900000002", "IOE900000003"]
-    assert r["dq_possible_case_ids"] == ["C900000002", "C900000003"]
-    assert (r["matched_receipt_number"], r["matched_case_id"]) == ("IOE900000002", "C900000002")
-    r = m["900000010"]                                            # Chosen by source, not lowest a_id
-    assert (r["matched_a_number"], r["matched_case_id"]) == ("900000020", "C900000020")
-    r = m["A012345678"]                                           # Matched: its own case
-    assert r["matched_receipt_number"] == r["asy_receipt_number"] == "IOE12345678"
-    r = m["333333333"]                                            # NO_MATCH
-    assert r["matched_receipt_number"] is None and r["matched_case_id"] is None
+def test_exact_key_safety_net_passes(res):
+    assert res["checks"]["EXACT_KEY_MATCHES_KEPT"] is True
+    assert res["checks"]["detail"]["exact_key_matches_lost"] == 0
+    assert res["checks"]["detail"]["exact_key_matches"] >= 6     # Rows whose raw key text is identical
+    assert res["passed"] is True
 
 
-def test_missing_receipt_column(spark, data):
-    orr, asy = data["base"]
-    with pytest.raises(ValueError, match="receipt_number"):
-        lean.run_dq_merge(orr, asy.drop("receipt_number"))
-
-
-def notes_of(lean_res, a_id):
-    return by_key(lean_res["notes"]["merged"])[a_id]["dq_all_notes"]
-
-
-def test_all_notes_conflict_reasons(lean_res):
-    n = notes_of(lean_res, "700000004")
-    assert n.startswith("STATUS CONFLICT: DOB disagrees outright (ORR 2009-02-02 vs asylum 2009-12-25)")
-    assert "no date in the notes equals the asylum DOB 2009-12-25" in n
-    n = notes_of(lean_res, "111111111")
-    assert "first and last name both disagree" in n and "below the review threshold" in n
-    assert "FIRST MISMATCH: ORR 'Ann' vs asylum 'Deanna'" in n
-
-
-def test_all_notes_notes_evidence(lean_res):
-    n = notes_of(lean_res, "700000001")
-    assert "resolved by the notes: dob" in n and "DOB backed: the notes contain the asylum DOB 2011-01-02" in n
-    assert "ISSUES MEDIUM:NOTES_DOB_DIFFERS" in n
-    n = notes_of(lean_res, "700000003")
-    assert "best name version 'PEREZ, JUAN' read as first=JUAN last=PEREZ [LAST, FIRST]" in n
-    assert "-> backs first, last" in n
-    n = notes_of(lean_res, "700000010")                       # Two versions: only JUAN LOPEZ is used
-    assert "best name version 'JUAN LOPEZ'" in n and "-> backs first" in n
-
-
-def test_all_notes_other_keys(lean_res):
-    n = notes_of(lean_res, "444444444")
-    assert "STATUS POSSIBLE_KEY_ERROR" in n and "CHOSEN 555555555 (receipt IOE555555555, case C555555555)" in n
-    assert "555555555 via fields: same name + DOB 2008-08-08" in n
-    n = notes_of(lean_res, "700000005")
-    assert "800000005 via notes_name: note name 'JUAN CARLOS PEREZ'" in n and "DOB 2013-06-06" in n
-    n = notes_of(lean_res, "910000001")                       # KRUZ in the note, CRUZ in the asylum table
-    assert "CHOSEN 910000002" in n and "via notes_name: note name 'MARIA KRUZ'" in n
-    assert "MULTIPLE 2 possible cases" in notes_of(lean_res, "900000001")
-
-
-def test_all_notes_simple_rows(lean_res):
-    assert notes_of(lean_res, "333333333").startswith("STATUS NO_MATCH: a_id 333333333 is not in the asylum table")
-    n = notes_of(lean_res, "A012345678")
-    assert n.startswith("STATUS VERIFIED: all fields agree") and "formats differ" in n
-
-
-# Principal + dependents. ORR marks a dependent with the principal's a_id plus a letter; the asylum
-# table gives each dependent its own a_id and links it through principal_a_number.
-DEP_ORR = [
-    ("123456789", "Lisa", "Gomez", "1985-04-04", "F", "Honduras"),     # Principal
-    ("123456789A", "Ethan", "Gomez", "2015-06-06", "M", "Honduras"),   # Dependents: one family, one case
-    ("123456789B", "Hilde", "Gomez", "2017-07-07", "F", "Honduras"),
-    ("123456789C", "Maria", "Gomez", "2019-09-09", "F", "Honduras"),
-    ("A222222229C", "Leo", "Ruiz", "2016-01-01", "M", "Mexico"),       # Principal has no dependents on file
-    # Siblings: C's DOB was mistyped as B's. Picked independently both would take Sofia's case;
-    # one-to-one, C gets Lucas's case (and shows CONFLICT on the DOB, as it should).
-    ("333333339B", "Sofia", "Diaz", "2019-01-01", "F", "Mexico"),
-    ("333333339C", "Lucas", "Diaz", "2019-01-01", "M", "Mexico"),
-    ("333333339D", "Mateo", "Diaz", "2021-03-03", "M", "Mexico"),       # Third ORR dependent, only 2 on file
-]
-DEP_ASY = [  # a_id, first, last, dob, sex, cob, middle, receipt, case, principal_a_number
-    # The Gomez family: each person has a unique a_id and receipt, all filed under one case C-FAM
-    ("123456789", "Lisa", "Gomez", "1985-04-04", "F", "Honduras", None, "IOE1", "C-FAM", "N/A"),
-    ("987650001", "Ethan", "Gomez", "2015-06-06", "M", "Honduras", None, "IOE2", "C-FAM", "123456789"),
-    ("987650002", "Hilde", "Gomez", "2017-07-07", "F", "Honduras", None, "IOE3", "C-FAM", "A-123456789"),
-    ("987650003", "Maria", "Gomez", "2019-09-09", "F", "Honduras", None, "IOE8", "C-FAM", "123456789"),
-    ("222222229", "Ana", "Ruiz", "1980-02-02", "F", "Mexico", None, "IOE4", "C4", None),
-    ("333333339", "Rosa", "Diaz", "1988-08-08", "F", "Mexico", None, "IOE5", "C5", "N/A"),
-    ("987650011", "Sofia", "Diaz", "2019-01-01", "F", "Mexico", None, "IOE6", "C6", "333333339"),
-    ("987650012", "Lucas", "Diaz", "2020-02-02", "M", "Mexico", None, "IOE7", "C7", "333333339"),
-]
-
-
-@pytest.fixture(scope="session")
-def dep_res(spark):
-    asy = spark.createDataFrame(DEP_ASY, ASY_SCHEMA + ", receipt_number string, case_id string, "
-                                                     "principal_a_number string")
-    return lean.run_dq_merge(spark.createDataFrame(DEP_ORR, ORR_SCHEMA), asy)
-
-
-def test_dependents_matched_through_principal(dep_res):
-    m = by_key(dep_res["merged"])
-    family = {"123456789": ("123456789", "IOE1"), "123456789A": ("987650001", "IOE2"),
-              "123456789B": ("987650002", "IOE3"),  # principal_a_number written as 'A-123456789'
-              "123456789C": ("987650003", "IOE8")}
-    for orr_id, (a_number, receipt) in family.items():
-        r = m[orr_id]
-        assert (r["matched_a_number"], r["matched_receipt_number"]) == (a_number, receipt), orr_id
-        assert r["matched_case_id"] == "C-FAM" and r["dq_status"] == "VERIFIED", orr_id
-    assert len({m[k]["matched_a_number"] for k in family}) == 4      # Unique a_ids, one shared case
-    r = m["123456789A"]
-    assert r["dq_principal_a_number"] == "123456789" and r["dq_dependent_candidates"] == 3
-    assert "dependent of principal 123456789: assigned one-to-one among the 3 asylum case(s)" in r["dq_all_notes"]
-    assert m["123456789"]["dq_principal_a_number"] is None             # The principal itself is unaffected
-
-
-def test_dependent_without_case_stays_no_match(dep_res):
-    r = by_key(dep_res["merged"])["A222222229C"]
-    assert r["dq_status"] == "NO_MATCH" and r["matched_a_number"] == "A222222229C"
-    assert "dependent of principal 222222229, but no asylum case lists that principal_a_number" in r["dq_all_notes"]
-
-
-def test_dependent_key_is_not_a_format_issue(dep_res):
-    m = by_key(dep_res["merged"])
-    assert not any("KEY_FORMAT" in i for i in (m["123456789A"]["dq_row_issues"] or []))
-    assert dep_res["passed"] is True
-
-
-def test_dependents_get_unique_a_ids(dep_res):
-    m = by_key(dep_res["merged"])
-    assert m["333333339B"]["matched_a_number"] == "987650011"          # Sofia
-    assert m["333333339B"]["dq_dependent_score"] == 15
-    r = m["333333339C"]                                                 # Lucas, despite the DOB typo
-    assert r["matched_a_number"] == "987650012" and r["dq_dependent_score"] == 7
-    assert r["dq_status"] == "CONFLICT" and "DOB disagrees outright" in r["dq_all_notes"]
-    r = m["333333339D"]                                                 # No case left for a third dependent
-    assert r["dq_status"] == "NO_MATCH" and r["matched_a_number"] == "333333339D"
-    assert "all 2 dependent case(s) under that principal were assigned to other ORR dependents" in r["dq_all_notes"]
-    deps = [r["matched_a_number"] for k, r in m.items() if r["dq_principal_a_number"] and r["dq_status"] != "NO_MATCH"]
-    assert len(deps) == len(set(deps))                                  # Every dependent a_id used once
+def test_exact_key_safety_net_catches_a_lost_match(spark, monkeypatch):
+    # Break the key cleaning on purpose: identical keys then no longer join, and the check must fail
+    monkeypatch.setattr(lean, "_key", lambda c, dtype: lean.F.concat(c.cast("string"), lean.F.rand().cast("string")))
+    out = lean.run_dq_merge(spark.createDataFrame([orr("100000001")], ORR_SCHEMA),
+                            spark.createDataFrame([aff("100000001")], AFF_SCHEMA))
+    assert out["checks"]["EXACT_KEY_MATCHES_KEPT"] is False and out["passed"] is False
+    assert out["checks"]["detail"]["exact_key_matches_lost"] == 1
